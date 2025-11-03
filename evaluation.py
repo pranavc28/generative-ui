@@ -34,7 +34,8 @@ def print_detailed_results(records: List[Dict]):
         has_code = rec.get("has_code", False)
         
         print(f"\n{task_id}: {'✅ HAS CODE' if has_code else '❌ NO CODE'}")
-        print(f"Instruction: {rec.get('instruction', '')[:100]}...")
+        print(f"User Message: {rec.get('user_message', '')[:100]}...")
+        print(f"System Prompt: {rec.get('system_prompt', '')[:100]}...")
         print(f"Expected length: {len(rec.get('expected_response', ''))} chars")
         print(f"Generated length: {len(rec.get('predicted_response', ''))} chars")
         print(f"Generated preview:\n{rec.get('predicted_response', '')[:200]}...")

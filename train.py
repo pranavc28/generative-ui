@@ -20,22 +20,28 @@ OUTPUT_DIR = "outputs"
 CHECKPOINT_NAME = "react-code-ppo"
 
 def format_react_example(example, idx):
-    instruction = example.get('instruction', '')
-    response = example.get('response', '')
+    messages = example.get('messages', [])
     
-    prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+    system_prompt = messages[0]['content'] if len(messages) > 0 else ''
+    user_message = messages[1]['content'] if len(messages) > 1 else ''
+    assistant_response = messages[2]['content'] if len(messages) > 2 else ''
+    
+    full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
     
     print(f"\n{'='*70}")
     print(f"EXAMPLE {idx}")
     print(f"{'='*70}")
-    print(f"INSTRUCTION:\n{instruction}\n")
-    print(f"REFERENCE RESPONSE:\n{response[:200]}...\n")
+    print(f"SYSTEM PROMPT (first 200 chars):\n{system_prompt[:200]}...\n")
+    print(f"USER REQUEST:\n{user_message}\n")
+    print(f"ASSISTANT RESPONSE (first 300 chars):\n{assistant_response[:300]}...\n")
+    print(f"FULL RESPONSE LENGTH: {len(assistant_response)} chars")
     print(f"{'='*70}")
     
     return {
-        "instruction": instruction,
-        "reference_response": response,
-        "prompt": prompt
+        "system_prompt": system_prompt,
+        "user_message": user_message,
+        "reference_response": assistant_response,
+        "full_prompt": full_prompt
     }
 
 def load_data():
@@ -105,7 +111,7 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         
         ref_response = ""
         for ex in data:
-            if ex["prompt"] == traj["prompt_text"]:
+            if ex["full_prompt"] == traj["prompt_text"]:
                 ref_response = ex["reference_response"]
                 break
         
@@ -160,7 +166,7 @@ def train_ppo():
         
         sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
         
-        prompts = [ex["prompt"] for ex in data]
+        prompts = [ex["full_prompt"] for ex in data]
         print(f"Sampling {NUM_SAMPLES_PER_PROMPT} trajectories per prompt...")
         trajectories = sample_trajectories(sampling_client, tokenizer, prompts)
         print(f"Generated {len(trajectories)} total trajectories")
@@ -200,12 +206,12 @@ def evaluate(sampling_client, tokenizer, data):
     )
     
     for idx, example in enumerate(data):
-        prompt_text = example["prompt"]
+        prompt_text = example["full_prompt"]
         expected_response = example["reference_response"]
-        instruction = example["instruction"]
+        user_message = example["user_message"]
         
         print(f"\n--- Evaluating Example {idx} ---")
-        print(f"Instruction: {instruction[:100]}...")
+        print(f"User Request: {user_message[:100]}...")
         
         prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
         future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
@@ -217,7 +223,8 @@ def evaluate(sampling_client, tokenizer, data):
         
         results.append({
             "task_id": f"example_{idx}",
-            "instruction": instruction,
+            "user_message": user_message,
+            "system_prompt": example["system_prompt"][:500],
             "expected_response": expected_response,
             "predicted_response": predicted,
             "has_code": has_code

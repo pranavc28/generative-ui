@@ -1,0 +1,252 @@
+================================================================================
+PROXIMAL POLICY OPTIMIZATION (PPO) ALGORITHM EXPLANATION
+================================================================================
+
+OVERVIEW:
+---------
+PPO is a policy gradient reinforcement learning algorithm designed to optimize
+a policy (in this case, an LLM) by learning from rewards. It's called "proximal"
+because it prevents the policy from changing too much between updates, making
+training more stable.
+
+KEY CONCEPTS:
+-------------
+
+1. POLICY (π):
+   - The model that generates React code
+   - Takes in: system prompt + user request
+   - Outputs: React/TypeScript code
+
+2. REWARD FUNCTION:
+   - Evaluates the quality of generated code
+   - Our implementation:
+     * Base reward: 1.0
+     * JSX bonus: +0.5 if code contains JSX elements (return, <, />)
+     * Length penalty: -0.1 × |generated_length - reference_length| / reference_length
+   - Better rewards = better code
+
+3. ADVANTAGE:
+   - Measures how much better an action is compared to average
+   - We compute: reward / num_tokens (spread reward across all generated tokens)
+   - Positive advantage = encourage this behavior
+   - Negative advantage = discourage this behavior
+
+
+THE PPO ALGORITHM (AS IMPLEMENTED):
+-----------------------------------
+
+STEP 1: SAMPLE TRAJECTORIES
+For each epoch (we do 3 epochs):
+  - Save current model weights
+  - For each of 5 prompts:
+    - Generate 4 different code completions (trajectories)
+    - Record: tokens generated + their log probabilities
+  - Total: 5 prompts × 4 samples = 20 trajectories per epoch
+
+STEP 2: COMPUTE REWARDS
+For each trajectory:
+  - Compare generated code to reference code
+  - Calculate reward based on:
+    * Does it have JSX structure? (+0.5)
+    * How close is length to reference? (penalty for big differences)
+  - Compute advantages (reward distributed over tokens)
+
+STEP 3: UPDATE POLICY (PPO Loss)
+The PPO loss function prevents large policy updates using "clipping":
+
+  L_PPO(θ) = E[min(ratio × A, clip(ratio, 1-ε, 1+ε) × A)]
+
+  Where:
+  - ratio = π_new(action) / π_old(action)  [importance sampling ratio]
+  - A = advantage (how good this action was)
+  - ε = clip_epsilon (0.2 in our case)
+  - clip prevents ratio from going beyond [0.8, 1.2]
+
+Why Clipping?
+- Without clipping: Large policy updates can destabilize training
+- With clipping: If new policy differs too much from old, we limit the update
+- Result: More stable, reliable training
+
+
+HOW OUR IMPLEMENTATION WORKS:
+------------------------------
+
+train.py does the following:
+
+1. INITIALIZATION:
+   - Load 5 React code examples from dataset
+   - Create Llama-3.2-1B model with LoRA adapters
+
+2. FOR EACH PPO EPOCH (3 total):
+   
+   a) ROLLOUT PHASE:
+      - Save current model weights
+      - Create sampling client with current weights
+      - For each prompt (5 prompts):
+        * Sample 4 trajectories (different React code completions)
+        * Store: prompt_tokens, generated_tokens, logprobs
+      - Total: 20 trajectories collected
+   
+   b) REWARD COMPUTATION:
+      - For each trajectory:
+        * Decode generated tokens to text
+        * Match with reference response
+        * Compute reward = compute_code_reward(generated, reference)
+        * Create advantages array (reward spread over tokens)
+   
+   c) DATA PREPARATION:
+      - Combine prompt + generated tokens
+      - Shift to create input/target pairs (next token prediction)
+      - Package into Datum objects with:
+        * model_input: token sequence
+        * loss_fn_inputs: {target_tokens, old_logprobs, advantages}
+   
+   d) POLICY UPDATE:
+      - Call forward_backward(data, loss_fn="ppo")
+      - Tinker computes PPO loss with clipping
+      - Update model parameters via optimizer (Adam)
+      - Learning rate: 1e-5
+
+3. EVALUATION:
+   - Generate code for each training example
+   - Check if generated code has proper structure
+   - Save results for analysis
+
+
+KEY PPO HYPERPARAMETERS:
+------------------------
+- PPO_CLIP_EPSILON = 0.2
+  * Controls how much policy can change
+  * 0.2 = policy ratio can be between [0.8, 1.2]
+  * Smaller = more conservative updates
+  
+- NUM_SAMPLES_PER_PROMPT = 4
+  * How many different solutions to try per problem
+  * More samples = better exploration but slower
+  
+- NUM_PPO_EPOCHS = 3
+  * How many times to update policy
+  * Each epoch uses fresh samples (on-policy)
+  
+- LEARNING_RATE = 1e-5
+  * How big each parameter update is
+  * Small LR for stable training
+
+
+WHY PPO FOR CODE GENERATION?
+-----------------------------
+
+1. EXPLORATION vs EXPLOITATION:
+   - Supervised learning: Model just imitates training data
+   - PPO: Model explores different solutions, learns from rewards
+   - Result: Can discover better/alternative solutions
+
+2. REWARD-BASED OPTIMIZATION:
+   - We can define what "good code" means (JSX, correct length, etc.)
+   - PPO optimizes directly for these criteria
+   - More flexible than just matching reference exactly
+
+3. STABILITY:
+   - PPO's clipping mechanism prevents catastrophic updates
+   - Policy changes gradually and safely
+   - Less likely to "forget" what it learned
+
+
+DIFFERENCES FROM SUPERVISED LEARNING:
+--------------------------------------
+
+Supervised Learning (SL):
+- Loss: Cross-entropy (match reference exactly)
+- Gradient: ∇log π(reference_tokens)
+- Limitation: Can only learn from exact reference
+
+PPO:
+- Loss: PPO loss (reward-weighted, clipped)
+- Gradient: ∇E[ratio × advantage]
+- Advantage: Can learn from exploration, optimize for rewards
+
+
+MATH BEHIND PPO LOSS:
+----------------------
+
+Standard Policy Gradient:
+  ∇J = E[∇log π(a|s) × A(s,a)]
+  - Maximize log probability of good actions (high advantage)
+  - Problem: Can make very large updates
+
+Importance Sampling (what we'd use without PPO):
+  ∇J = E[(π_new/π_old) × A(s,a) × ∇log π_new(a|s)]
+  - Accounts for sampling from old policy
+  - Problem: Ratio can explode if policies diverge
+
+PPO Solution:
+  ∇J = E[min(ratio × A, clip(ratio, 1-ε, 1+ε) × A)]
+  - If ratio > 1+ε (new policy much more likely): clip to 1+ε
+  - If ratio < 1-ε (new policy much less likely): clip to 1-ε
+  - Result: Bounded, stable updates
+
+
+PRACTICAL EXAMPLE:
+------------------
+
+Imagine training on "create a button":
+
+Initial Policy Output:
+  <div>button</div>  (reward: 0.5, no proper JSX)
+
+After PPO Epoch 1:
+  <button>Click</button>  (reward: 1.5, has proper JSX)
+  
+The algorithm:
+1. Samples both versions during exploration
+2. Sees second version gets higher reward (+1.0 improvement)
+3. Updates policy to make second version more likely
+4. But clips update to prevent over-optimization
+5. Next epoch: Generates better code more often
+
+After 3 Epochs:
+  <button className="px-4 py-2">Click</button>
+  (reward: 1.8, proper JSX + better structure)
+
+
+MONITORING TRAINING:
+--------------------
+
+Key metrics to watch:
+- Avg LogProb: Should stay relatively stable (not decrease too fast)
+- KL Divergence: Should stay < 0.01 (policies not diverging)
+- Rewards: Should increase over epochs
+- Code structure rate: % of outputs with valid React code
+
+
+LIMITATIONS OF OUR IMPLEMENTATION:
+-----------------------------------
+
+1. SIMPLE REWARDS:
+   - We use heuristic rewards (JSX presence, length)
+   - Better: Execute code, check if it runs, measure quality
+
+2. SMALL SCALE:
+   - Only 5 examples, 3 epochs
+   - Production: 1000s of examples, 10s of epochs
+
+3. ON-POLICY ONLY:
+   - We resample after each epoch
+   - Could be more efficient with replay buffer
+
+4. NO VALUE FUNCTION:
+   - True PPO includes value function for better advantages
+   - We use simple reward-based advantages
+
+
+SUMMARY:
+--------
+PPO is a stable, efficient algorithm for training models with reward signals.
+Our implementation uses it to fine-tune an LLM to generate better React code
+by exploring different solutions and learning from structured rewards.
+
+The key innovation: Clipped importance sampling prevents policy from changing
+too drastically, making training reliable and predictable.
+
+================================================================================
+
