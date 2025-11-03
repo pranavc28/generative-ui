@@ -1,66 +1,53 @@
-import yaml
 from datasets import load_dataset
 
-CONFIG_PATH = "tinker.yaml"
+DATASET_NAME = "cfahlgren1/react-code-instructions"
+NUM_EXAMPLES = 5
 
-def load_config():
-    with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f)
-
-def format_toolbench_example(example, idx):
-    system = example.get('system', '')
-    chat = example.get('chat', '')
+def format_react_example(example, idx):
+    instruction = example.get('instruction', '')
+    response = example.get('response', '')
     
-    user_msg = chat.split('\n\n\nASSISTANT:')[0] if '\n\n\nASSISTANT:' in chat else chat.split('\n\n\nA:')[0]
-    assistant_response = chat.split('\n\n\nASSISTANT:')[1].split('<|endoftext|>')[0].strip() if '\n\n\nASSISTANT:' in chat else ""
-    
-    eval_prompt = f"{system}\n\n{user_msg}\n\n\nASSISTANT:"
+    prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
     
     print(f"\n{'='*70}")
     print(f"EXAMPLE {idx}")
     print(f"{'='*70}")
-    print(f"TRAINING INPUT:\n{system}\n")
-    print(f"TRAINING OUTPUT:\n{chat}\n")
-    print(f"--- EVALUATION ---")
-    print(f"EVAL PROMPT (model sees this):\n{eval_prompt}\n")
-    print(f"EXPECTED COMPLETION:\n{assistant_response}\n")
+    print(f"INSTRUCTION:\n{instruction}\n")
+    print(f"REFERENCE RESPONSE (first 500 chars):\n{response[:500]}...\n")
+    print(f"FULL RESPONSE LENGTH: {len(response)} chars\n")
+    print(f"PROMPT FOR MODEL:\n{prompt}\n")
     print(f"{'='*70}")
     
     return {
-        "input": system, 
-        "output": chat,
-        "user_message": user_msg,
-        "assistant_response": assistant_response,
-        "eval_input": eval_prompt
+        "instruction": instruction,
+        "reference_response": response,
+        "prompt": prompt
     }
 
-config = load_config()
-dataset_name = config['data']['dataset']
-split = config['data']['split']
-num_examples = config['data']['num_examples']
-
-print(f"Loading dataset: {dataset_name}")
-print(f"Split: {split}")
-print(f"Number of examples: {num_examples}\n")
+print(f"Loading dataset: {DATASET_NAME}")
+print(f"Number of examples to inspect: {NUM_EXAMPLES}\n")
 
 try:
-    dataset = load_dataset(dataset_name, split=split)
-    print(f"✅ Successfully loaded {dataset_name}")
+    dataset = load_dataset(DATASET_NAME, split="train")
+    print(f"✅ Successfully loaded {DATASET_NAME}")
 except Exception as e:
-    print(f"❌ Failed to load {dataset_name}: {e}")
-    print("\nTrying alternative: glaiveai/glaive-function-calling-v2")
-    dataset = load_dataset("glaiveai/glaive-function-calling-v2", split="train")
-    print(f"✅ Successfully loaded alternative dataset")
+    print(f"❌ Failed to load {DATASET_NAME}: {e}")
+    exit(1)
 
 print(f"Total examples in dataset: {len(dataset)}\n")
 
-selected = dataset.select(range(min(num_examples, len(dataset))))
-formatted_examples = [format_toolbench_example(ex, i) for i, ex in enumerate(selected)]
+selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
+formatted_examples = [format_react_example(ex, i) for i, ex in enumerate(selected)]
 
-print(f"\n{'='*60}")
-print(f"SUMMARY")
-print(f"{'='*60}")
+print(f"\n{'='*70}")
+print(f"DATASET SUMMARY")
+print(f"{'='*70}")
 print(f"Total examples processed: {len(formatted_examples)}")
-print(f"Average input length: {sum(len(e['input']) for e in formatted_examples) / len(formatted_examples):.0f} chars")
-print(f"Average output length: {sum(len(e['output']) for e in formatted_examples) / len(formatted_examples):.0f} chars")
+print(f"Average instruction length: {sum(len(e['instruction']) for e in formatted_examples) / len(formatted_examples):.0f} chars")
+print(f"Average response length: {sum(len(e['reference_response']) for e in formatted_examples) / len(formatted_examples):.0f} chars")
+
+code_keywords = ['function', 'const', 'return', 'import', 'export']
+has_code_structure = sum(1 for ex in formatted_examples if any(kw in ex['reference_response'] for kw in code_keywords))
+print(f"Examples with code structure: {has_code_structure}/{len(formatted_examples)}")
+print(f"{'='*70}")
 

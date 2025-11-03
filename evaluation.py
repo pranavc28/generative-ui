@@ -1,9 +1,9 @@
 import json
-from typing import List, Tuple, Dict
+from typing import List, Dict
 
 EVAL_PATH = "outputs/eval_results.jsonl"
 
-def load_rollouts(path: str) -> List[Dict]:
+def load_results(path: str) -> List[Dict]:
     records = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -11,45 +11,18 @@ def load_rollouts(path: str) -> List[Dict]:
             records.append(rec)
     return records
 
-def compute_trajectory_metrics(records: List[Dict]) -> Tuple[float, float, float]:
-    TP = FP = FN = 0
-    for rec in records:
-        if rec.get("pred_success") and rec.get("gold_success"):
-            TP += 1
-        if rec.get("pred_success") and not rec.get("gold_success"):
-            FP += 1
-        if not rec.get("pred_success") and rec.get("gold_success"):
-            FN += 1
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    return precision, recall, f1
-
-def compute_action_metrics(records: List[Dict]) -> Tuple[float, float, float]:
-    TP = FP = FN = 0
-    for rec in records:
-        gold = rec.get("gold_actions", [])
-        pred = rec.get("pred_actions", [])
-        L = min(len(gold), len(pred))
-        for i in range(L):
-            if pred[i] == gold[i]:
-                TP += 1
-            else:
-                FP += 1
-                FN += 1
-        if len(pred) > L:
-            FP += (len(pred) - L)
-        if len(gold) > L:
-            FN += (len(gold) - L)
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    return precision, recall, f1
-
-def compute_simple_metrics(records: List[Dict]) -> float:
-    matches = sum(1 for r in records if r.get("match", False))
-    accuracy = matches / len(records) if len(records) > 0 else 0.0
-    return accuracy
+def compute_code_metrics(records: List[Dict]) -> Dict[str, float]:
+    total = len(records)
+    with_code = sum(1 for r in records if r.get("has_code", False))
+    
+    avg_gen_length = sum(len(r.get("predicted_response", "")) for r in records) / total if total > 0 else 0
+    avg_ref_length = sum(len(r.get("expected_response", "")) for r in records) / total if total > 0 else 0
+    
+    return {
+        "code_generation_rate": with_code / total if total > 0 else 0.0,
+        "avg_generated_length": avg_gen_length,
+        "avg_reference_length": avg_ref_length
+    }
 
 def print_detailed_results(records: List[Dict]):
     print("\n" + "="*70)
@@ -58,33 +31,27 @@ def print_detailed_results(records: List[Dict]):
     
     for rec in records:
         task_id = rec.get("task_id", "unknown")
-        match = rec.get("match", False)
+        has_code = rec.get("has_code", False)
         
-        print(f"\n{task_id}: {'✅ MATCH' if match else '❌ NO MATCH'}")
-        print(f"User Message: {rec.get('user_message', '')[:100]}...")
-        print(f"Expected: {rec.get('expected_response', '')[:100]}...")
-        print(f"Predicted: {rec.get('predicted_response', '')[:100]}...")
+        print(f"\n{task_id}: {'✅ HAS CODE' if has_code else '❌ NO CODE'}")
+        print(f"Instruction: {rec.get('instruction', '')[:100]}...")
+        print(f"Expected length: {len(rec.get('expected_response', ''))} chars")
+        print(f"Generated length: {len(rec.get('predicted_response', ''))} chars")
+        print(f"Generated preview:\n{rec.get('predicted_response', '')[:200]}...")
 
 def main():
-    records = load_rollouts(EVAL_PATH)
+    records = load_results(EVAL_PATH)
     
     print("="*70)
-    print("EVALUATION METRICS")
+    print("REACT CODE GENERATION METRICS")
     print("="*70)
     
-    if "match" in records[0]:
-        accuracy = compute_simple_metrics(records)
-        print(f"\nAccuracy: {accuracy:.4f} ({sum(r.get('match', False) for r in records)}/{len(records)} correct)")
+    metrics = compute_code_metrics(records)
     
-    if "gold_success" in records[0] and "pred_success" in records[0]:
-        traj_p, traj_r, traj_f1 = compute_trajectory_metrics(records)
-        print("\n== Trajectory-level ==")
-        print(f"Precision: {traj_p:.4f} | Recall: {traj_r:.4f} | F1: {traj_f1:.4f}")
-    
-    if "gold_actions" in records[0] and "pred_actions" in records[0]:
-        action_p, action_r, action_f1 = compute_action_metrics(records)
-        print("\n== Action-level ==")
-        print(f"Precision: {action_p:.4f} | Recall: {action_r:.4f} | F1: {action_f1:.4f}")
+    print(f"\nCode Generation Rate: {metrics['code_generation_rate']:.2%}")
+    print(f"Avg Generated Length: {metrics['avg_generated_length']:.0f} chars")
+    print(f"Avg Reference Length: {metrics['avg_reference_length']:.0f} chars")
+    print(f"Total Examples: {len(records)}")
     
     print_detailed_results(records)
 

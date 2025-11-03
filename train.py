@@ -1,178 +1,249 @@
 import os
 import json
-import yaml
 import numpy as np
 import tinker
 from tinker import types
 from datasets import load_dataset
 
-CONFIG_PATH = "tinker.yaml"
+DATASET_NAME = "cfahlgren1/react-code-instructions"
+NUM_EXAMPLES = 5
+BASE_MODEL = "meta-llama/Llama-3.2-1B"
+LEARNING_RATE = 1e-5
+NUM_PPO_EPOCHS = 3
+NUM_SAMPLES_PER_PROMPT = 4
+MAX_GENERATION_TOKENS = 512
+PPO_CLIP_EPSILON = 0.2
+VALUE_CLIP_EPSILON = 0.2
+GAE_LAMBDA = 0.95
+ENTROPY_COEFF = 0.01
+OUTPUT_DIR = "outputs"
+CHECKPOINT_NAME = "react-code-ppo"
 
-def load_config():
-    with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f)
-
-def format_toolbench_example(example, idx):
-    system = example.get('system', '')
-    chat = example.get('chat', '')
+def format_react_example(example, idx):
+    instruction = example.get('instruction', '')
+    response = example.get('response', '')
     
-    user_msg = chat.split('\n\n\nASSISTANT:')[0] if '\n\n\nASSISTANT:' in chat else chat.split('\n\n\nA:')[0]
-    assistant_response = chat.split('\n\n\nASSISTANT:')[1].split('<|endoftext|>')[0].strip() if '\n\n\nASSISTANT:' in chat else ""
-    
-    eval_prompt = f"{system}\n\n{user_msg}\n\n\nASSISTANT:"
+    prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
     
     print(f"\n{'='*70}")
     print(f"EXAMPLE {idx}")
     print(f"{'='*70}")
-    print(f"SYSTEM:\n{system}\n")
-    print(f"USER MESSAGE:\n{user_msg}\n")
-    print(f"EXPECTED RESPONSE:\n{assistant_response}\n")
-    print(f"EVAL PROMPT (ends with 'ASSISTANT:'):\n{eval_prompt[-100:]}...\n")
+    print(f"INSTRUCTION:\n{instruction}\n")
+    print(f"REFERENCE RESPONSE:\n{response[:200]}...\n")
     print(f"{'='*70}")
     
     return {
-        "input": system, 
-        "output": chat,
-        "user_message": user_msg,
-        "assistant_response": assistant_response,
-        "eval_input": eval_prompt
+        "instruction": instruction,
+        "reference_response": response,
+        "prompt": prompt
     }
 
-def load_data(config):
-    dataset_name = config['data']['dataset']
-    split = config['data']['split']
-    num_examples = config['data']['num_examples']
-    
-    print(f"Loading dataset: {dataset_name}")
-    dataset = load_dataset(dataset_name, split=split)
+def load_data():
+    print(f"Loading dataset: {DATASET_NAME}")
+    dataset = load_dataset(DATASET_NAME, split="train")
     
     print(f"Dataset loaded. Total examples: {len(dataset)}")
-    print(f"Selecting first {num_examples} examples\n")
+    print(f"Selecting first {NUM_EXAMPLES} examples\n")
     
-    selected = dataset.select(range(min(num_examples, len(dataset))))
-    return [format_toolbench_example(ex, i) for i, ex in enumerate(selected)]
+    selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
+    return [format_react_example(ex, i) for i, ex in enumerate(selected)]
 
-def process_example(example, tokenizer, idx=None):
-    prompt = example['input']
-    completion = f" {example['output']}\n\n"
+def compute_code_reward(generated_code, reference_code):
+    gen_len = len(generated_code)
+    ref_len = len(reference_code)
     
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
-    prompt_weights = [0] * len(prompt_tokens)
-    completion_tokens = tokenizer.encode(completion, add_special_tokens=False)
-    completion_weights = [1] * len(completion_tokens)
+    has_jsx = "return" in generated_code.lower() and ("<" in generated_code or "/>" in generated_code)
+    length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * 0.1
+    jsx_bonus = 0.5 if has_jsx else 0.0
+    base_reward = 1.0
     
-    tokens = prompt_tokens + completion_tokens
-    weights = prompt_weights + completion_weights
+    return base_reward + length_penalty + jsx_bonus
+
+def sample_trajectories(sampling_client, tokenizer, prompts):
+    trajectories = []
     
-    input_tokens = tokens[:-1]
-    target_tokens = tokens[1:]
-    weights = weights[1:]
-    
-    if idx is not None:
-        print(f"  Example {idx}: {len(prompt_tokens)} prompt tokens + {len(completion_tokens)} completion tokens = {len(tokens)} total")
-    
-    return types.Datum(
-        model_input=types.ModelInput.from_ints(tokens=input_tokens),
-        loss_fn_inputs=dict(weights=weights, target_tokens=target_tokens)
+    params = types.SamplingParams(
+        max_tokens=MAX_GENERATION_TOKENS, 
+        temperature=0.7, 
+        top_p=0.9,
+        stop=["###", "\n\n\n"]
     )
+    
+    for prompt_text in prompts:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        prompt_input = types.ModelInput.from_ints(prompt_tokens)
+        
+        future = sampling_client.sample(
+            prompt=prompt_input, 
+            sampling_params=params, 
+            num_samples=NUM_SAMPLES_PER_PROMPT
+        )
+        result = future.result()
+        
+        for seq in result.sequences:
+            generated_tokens = seq.tokens
+            if seq.logprobs is None:
+                print("WARNING: No logprobs returned from sampling. Using zeros as placeholder.")
+                logprobs = [0.0] * len(generated_tokens)
+            else:
+                logprobs = seq.logprobs
+            
+            trajectories.append({
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": generated_tokens,
+                "logprobs": logprobs,
+                "prompt_text": prompt_text
+            })
+    
+    return trajectories
 
-def train_ppo(config):
+def process_trajectories_for_ppo(trajectories, data, tokenizer):
+    processed_data = []
+    
+    for traj in trajectories:
+        generated_text = tokenizer.decode(traj["generated_tokens"])
+        
+        ref_response = ""
+        for ex in data:
+            if ex["prompt"] == traj["prompt_text"]:
+                ref_response = ex["reference_response"]
+                break
+        
+        reward = compute_code_reward(generated_text, ref_response)
+        
+        all_tokens = traj["prompt_tokens"] + traj["generated_tokens"]
+        target_tokens = all_tokens[1:]
+        input_tokens = all_tokens[:-1]
+        
+        old_logprobs = [0.0] * len(traj["prompt_tokens"]) + traj["logprobs"]
+        old_logprobs = old_logprobs[1:]
+        
+        advantages = [reward / len(traj["generated_tokens"])] * len(old_logprobs)
+        
+        datum = types.Datum(
+            model_input=types.ModelInput.from_ints(tokens=input_tokens),
+            loss_fn_inputs={
+                "target_tokens": target_tokens,
+                "logprobs": old_logprobs,
+                "advantages": advantages
+            }
+        )
+        processed_data.append(datum)
+    
+    return processed_data
+
+def train_ppo():
     service_client = tinker.ServiceClient()
-    model_name = config['model']['base_model']
-    training_client = service_client.create_lora_training_client(base_model=model_name)
+    training_client = service_client.create_lora_training_client(base_model=BASE_MODEL)
     
     tokenizer = training_client.get_tokenizer()
     
-    data = load_data(config)
+    data = load_data()
     
-    print(f"\nTokenizing {len(data)} examples...")
-    processed_examples = [process_example(ex, tokenizer, idx=i) for i, ex in enumerate(data)]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    ppo_config = config['ppo']
-    output_dir = config['data']['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n{'='*70}")
+    print(f"PPO TRAINING CONFIGURATION")
+    print(f"{'='*70}")
+    print(f"Base Model: {BASE_MODEL}")
+    print(f"Learning Rate: {LEARNING_RATE}")
+    print(f"PPO Epochs: {NUM_PPO_EPOCHS}")
+    print(f"Samples per Prompt: {NUM_SAMPLES_PER_PROMPT}")
+    print(f"Clip Epsilon: {PPO_CLIP_EPSILON}")
+    print(f"Total Examples: {len(data)}")
+    print(f"{'='*70}\n")
     
-    print(f"\nTraining with lr={ppo_config['learning_rate']}")
-    print(f"Total examples: {len(data)}")
-    
-    num_epochs = ppo_config['epochs_per_update']
-    
-    for epoch in range(num_epochs):
-        fwdbwd_future = training_client.forward_backward(processed_examples, "cross_entropy")
+    for epoch in range(NUM_PPO_EPOCHS):
+        print(f"\n{'='*70}")
+        print(f"PPO EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
+        print(f"{'='*70}")
+        
+        sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
+        
+        prompts = [ex["prompt"] for ex in data]
+        print(f"Sampling {NUM_SAMPLES_PER_PROMPT} trajectories per prompt...")
+        trajectories = sample_trajectories(sampling_client, tokenizer, prompts)
+        print(f"Generated {len(trajectories)} total trajectories")
+        
+        print(f"Processing trajectories for PPO update...")
+        processed_examples = process_trajectories_for_ppo(trajectories, data, tokenizer)
+        
+        fwdbwd_future = training_client.forward_backward(processed_examples, "ppo")
         optim_future = training_client.optim_step(
-            types.AdamParams(learning_rate=ppo_config['learning_rate'])
+            types.AdamParams(learning_rate=LEARNING_RATE)
         )
         
         fwdbwd_result = fwdbwd_future.result()
         optim_result = optim_future.result()
         
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
-        weights = np.concatenate([ex.loss_fn_inputs['weights'].tolist() for ex in processed_examples])
-        loss = -np.dot(logprobs, weights) / weights.sum()
+        avg_logprob = np.mean(logprobs)
         
-        print(f"Epoch {epoch + 1}/{num_epochs} - Loss: {loss:.4f}")
+        print(f"Epoch {epoch + 1} - Avg LogProb: {avg_logprob:.4f}")
     
-    checkpoint_name = config['checkpoint']['save_name']
-    sampling_client = training_client.save_weights_and_get_sampling_client(name=checkpoint_name)
+    sampling_client = training_client.save_weights_and_get_sampling_client(name=CHECKPOINT_NAME)
     
-    print(f"\nModel saved as {checkpoint_name}")
+    print(f"\nModel saved as {CHECKPOINT_NAME}")
     
     return sampling_client, tokenizer, data
 
 def evaluate(sampling_client, tokenizer, data):
-    print("\n=== Evaluation ===")
+    print(f"\n{'='*70}")
+    print("EVALUATION")
+    print(f"{'='*70}")
     results = []
     
-    params = types.SamplingParams(max_tokens=512, temperature=0.0, stop=["<|endoftext|>", "\n\n\n"])
+    params = types.SamplingParams(
+        max_tokens=MAX_GENERATION_TOKENS, 
+        temperature=0.0, 
+        stop=["###", "\n\n\n"]
+    )
     
     for idx, example in enumerate(data):
-        eval_prompt = example["eval_input"]
-        expected_response = example["assistant_response"]
-        user_msg = example["user_message"]
+        prompt_text = example["prompt"]
+        expected_response = example["reference_response"]
+        instruction = example["instruction"]
         
         print(f"\n--- Evaluating Example {idx} ---")
-        print(f"Prompt ends with: ...{eval_prompt[-50:]}")
+        print(f"Instruction: {instruction[:100]}...")
         
-        prompt = types.ModelInput.from_ints(tokenizer.encode(eval_prompt))
+        prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
         future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
         result = future.result()
         
         predicted = tokenizer.decode(result.sequences[0].tokens).strip()
         
-        match = predicted == expected_response
+        has_code = "function" in predicted or "const" in predicted or "return" in predicted
         
         results.append({
             "task_id": f"example_{idx}",
-            "user_message": user_msg,
+            "instruction": instruction,
             "expected_response": expected_response,
             "predicted_response": predicted,
-            "match": match
+            "has_code": has_code
         })
         
-        print(f"Expected: {expected_response[:100]}...")
-        print(f"Predicted: {predicted[:100]}...")
-        print(f"Match: {match}")
+        print(f"Expected length: {len(expected_response)} chars")
+        print(f"Generated length: {len(predicted)} chars")
+        print(f"Has code structure: {has_code}")
+        print(f"Generated code preview:\n{predicted[:300]}...")
     
-    config = load_config()
-    output_dir = config['data']['output_dir']
-    
-    with open(f"{output_dir}/eval_results.jsonl", "w") as f:
+    with open(f"{OUTPUT_DIR}/eval_results.jsonl", "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     
-    accuracy = sum(r["match"] for r in results) / len(results) if results else 0.0
+    code_rate = sum(r["has_code"] for r in results) / len(results) if results else 0.0
     print(f"\n{'='*70}")
     print(f"EVALUATION SUMMARY")
     print(f"{'='*70}")
     print(f"Total examples: {len(results)}")
-    print(f"Exact matches: {sum(r['match'] for r in results)}")
-    print(f"Accuracy: {accuracy:.2%}")
-    print(f"Results saved to: {output_dir}/eval_results.jsonl")
+    print(f"Examples with code structure: {sum(r['has_code'] for r in results)}")
+    print(f"Code generation rate: {code_rate:.2%}")
+    print(f"Results saved to: {OUTPUT_DIR}/eval_results.jsonl")
     
     return results
 
 if __name__ == "__main__":
-    config = load_config()
-    sampling_client, tokenizer, data = train_ppo(config)
+    sampling_client, tokenizer, data = train_ppo()
     evaluate(sampling_client, tokenizer, data)
 
