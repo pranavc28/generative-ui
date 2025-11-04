@@ -6,8 +6,8 @@ from tinker import types
 from datasets import load_dataset
 
 DATASET_NAME = "cfahlgren1/react-code-instructions"
-NUM_EXAMPLES = 5
-BASE_MODEL = "meta-llama/Llama-3.2-1B"
+NUM_EXAMPLES = 5  # Increased for better generalization -> freshbeer was here
+BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 3
 NUM_SAMPLES_PER_PROMPT = 4
@@ -17,23 +17,34 @@ VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo"
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b"
 
-def format_react_example(example, idx):
+def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
     
     system_prompt = messages[0]['content'] if len(messages) > 0 else ''
     user_message = messages[1]['content'] if len(messages) > 1 else ''
     assistant_response = messages[2]['content'] if len(messages) > 2 else ''
     
-    full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+    if tokenizer:
+        chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        full_prompt = tokenizer.apply_chat_template(
+            chat_messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+    else:
+        full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
     
     print(f"\n{'='*70}")
     print(f"EXAMPLE {idx}")
     print(f"{'='*70}")
-    print(f"SYSTEM PROMPT (first 200 chars):\n{system_prompt[:200]}...\n")
+    print(f"SYSTEM PROMPT:\n{system_prompt}...\n")
     print(f"USER REQUEST:\n{user_message}\n")
-    print(f"ASSISTANT RESPONSE (first 300 chars):\n{assistant_response[:300]}...\n")
+    print(f"ASSISTANT RESPONSE:\n{assistant_response}\n")
     print(f"FULL RESPONSE LENGTH: {len(assistant_response)} chars")
     print(f"{'='*70}")
     
@@ -44,7 +55,7 @@ def format_react_example(example, idx):
         "full_prompt": full_prompt
     }
 
-def load_data():
+def load_data(tokenizer=None):
     print(f"Loading dataset: {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
     
@@ -52,7 +63,7 @@ def load_data():
     print(f"Selecting first {NUM_EXAMPLES} examples\n")
     
     selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
-    return [format_react_example(ex, i) for i, ex in enumerate(selected)]
+    return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
 
 def compute_code_reward(generated_code, reference_code):
     gen_len = len(generated_code)
@@ -72,7 +83,7 @@ def sample_trajectories(sampling_client, tokenizer, prompts):
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.7, 
         top_p=0.9,
-        stop=["###", "\n\n\n"]
+        stop=[]
     )
     
     for prompt_text in prompts:
@@ -120,11 +131,13 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         all_tokens = traj["prompt_tokens"] + traj["generated_tokens"]
         target_tokens = all_tokens[1:]
         input_tokens = all_tokens[:-1]
-        
+
         old_logprobs = [0.0] * len(traj["prompt_tokens"]) + traj["logprobs"]
         old_logprobs = old_logprobs[1:]
-        
-        advantages = [reward / len(traj["generated_tokens"])] * len(old_logprobs)
+
+        prompt_length = len(traj["prompt_tokens"]) - 1
+        generated_length = len(traj["generated_tokens"])
+        advantages = [0.0] * prompt_length + [reward / generated_length] * generated_length
         
         datum = types.Datum(
             model_input=types.ModelInput.from_ints(tokens=input_tokens),
@@ -143,8 +156,8 @@ def train_ppo():
     training_client = service_client.create_lora_training_client(base_model=BASE_MODEL)
     
     tokenizer = training_client.get_tokenizer()
-    
-    data = load_data()
+
+    data = load_data(tokenizer)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -180,7 +193,6 @@ def train_ppo():
         )
         
         fwdbwd_result = fwdbwd_future.result()
-        optim_result = optim_future.result()
         
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
         avg_logprob = np.mean(logprobs)
@@ -202,7 +214,7 @@ def evaluate(sampling_client, tokenizer, data):
     params = types.SamplingParams(
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.0, 
-        stop=["###", "\n\n\n"]
+        stop=[]  # Match training: no stop sequences
     )
     
     for idx, example in enumerate(data):
@@ -211,7 +223,7 @@ def evaluate(sampling_client, tokenizer, data):
         user_message = example["user_message"]
         
         print(f"\n--- Evaluating Example {idx} ---")
-        print(f"User Request: {user_message[:100]}...")
+        print(f"User Request: {user_message}...")
         
         prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
         future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
@@ -224,7 +236,7 @@ def evaluate(sampling_client, tokenizer, data):
         results.append({
             "task_id": f"example_{idx}",
             "user_message": user_message,
-            "system_prompt": example["system_prompt"][:500],
+            "system_prompt": example["system_prompt"],
             "expected_response": expected_response,
             "predicted_response": predicted,
             "has_code": has_code
@@ -233,7 +245,7 @@ def evaluate(sampling_client, tokenizer, data):
         print(f"Expected length: {len(expected_response)} chars")
         print(f"Generated length: {len(predicted)} chars")
         print(f"Has code structure: {has_code}")
-        print(f"Generated code preview:\n{predicted[:300]}...")
+        print(f"Generated code preview:\n{predicted}...")
     
     with open(f"{OUTPUT_DIR}/eval_results.jsonl", "w") as f:
         for r in results:
