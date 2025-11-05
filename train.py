@@ -1,9 +1,12 @@
 import os
 import json
+import re
 import numpy as np
 import tinker
 from tinker import types
 from datasets import load_dataset
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import CountVectorizer
 
 DATASET_NAME = "cfahlgren1/react-code-instructions"
 NUM_EXAMPLES = 5  # Increased for better generalization -> freshbeer was here
@@ -11,13 +14,20 @@ BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 3
 NUM_SAMPLES_PER_PROMPT = 4
-MAX_GENERATION_TOKENS = 512
+MAX_GENERATION_TOKENS = 4096  # Increased from 512 to handle full React components
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b"
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v2"
+
+# Reward Component Weights (adjust based on priorities)
+REWARD_BASE = 1.0               # Base reward for any generation
+REWARD_LENGTH_WEIGHT = 0.1      # Weight for length penalty (lower = less important)
+REWARD_JSX_BONUS = 0.5          # Bonus for having JSX structure
+REWARD_TAILWIND_WEIGHT = 0.4    # Weight for TailwindCSS similarity (0.4 = moderate importance)
+REWARD_STRUCTURE_WEIGHT = 1.0   # Weight for JSX structure (1.0 = high importance)
 
 def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
@@ -66,15 +76,84 @@ def load_data(tokenizer=None):
     return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
 
 def compute_code_reward(generated_code, reference_code):
+    """
+    Compute reward based on three metrics:
+    1. JSX presence and length penalty
+    2. TailwindCSS class similarity 
+    3. JSX structure similarity using simple AST parsing
+    """
     gen_len = len(generated_code)
     ref_len = len(reference_code)
     
+    # Metric 1: JSX presence and length penalty
     has_jsx = "return" in generated_code.lower() and ("<" in generated_code or "/>" in generated_code)
-    length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * 0.1
-    jsx_bonus = 0.5 if has_jsx else 0.0
-    base_reward = 1.0
+    length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * REWARD_LENGTH_WEIGHT
+    jsx_bonus = REWARD_JSX_BONUS if has_jsx else 0.0
     
-    return base_reward + length_penalty + jsx_bonus
+    # Metric 2: TailwindCSS similarity using cosine similarity
+    tailwind_reward = 0.0
+    try:
+        # Extract className attributes from both codes
+        gen_classes = re.findall(r'className=["\']([^"\']+)["\']', generated_code)
+        ref_classes = re.findall(r'className=["\']([^"\']+)["\']', reference_code)
+        
+        if gen_classes and ref_classes:
+            # Flatten all classes into single strings
+            gen_tailwind = ' '.join(gen_classes)
+            ref_tailwind = ' '.join(ref_classes)
+            
+            # Use CountVectorizer for simple token-based similarity
+            vectorizer = CountVectorizer()
+            try:
+                vectors = vectorizer.fit_transform([ref_tailwind, gen_tailwind])
+                similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
+                # Convert similarity (0-1) to reward/penalty scaled by weight
+                tailwind_reward = (similarity - 0.5) * REWARD_TAILWIND_WEIGHT * 2
+            except:
+                tailwind_reward = -0.2 * REWARD_TAILWIND_WEIGHT  # Penalty if vectorization fails
+        elif ref_classes and not gen_classes:
+            tailwind_reward = -0.5 * REWARD_TAILWIND_WEIGHT  # Penalty for missing TailwindCSS when expected
+        elif not ref_classes and not gen_classes:
+            tailwind_reward = 0.0  # Neutral if neither has Tailwind
+    except:
+        tailwind_reward = 0.0
+    
+    # Metric 3: JSX structure similarity using simple tree-based comparison
+    jsx_structure_reward = 0.0
+    try:
+        # Extract JSX tags (simplified AST approach without tree-sitter)
+        gen_tags = re.findall(r'<(\w+)[\s>]', generated_code)
+        ref_tags = re.findall(r'<(\w+)[\s>]', reference_code)
+        
+        if gen_tags and ref_tags:
+            # Create tag frequency distributions
+            gen_tag_str = ' '.join(gen_tags)
+            ref_tag_str = ' '.join(ref_tags)
+            
+            vectorizer = CountVectorizer()
+            try:
+                vectors = vectorizer.fit_transform([ref_tag_str, gen_tag_str])
+                tag_similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
+                
+                # Also check tag count similarity
+                tag_count_ratio = min(len(gen_tags), len(ref_tags)) / max(len(gen_tags), len(ref_tags), 1)
+                
+                # Combined structure reward (70% tag similarity + 30% count ratio)
+                structure_score = (tag_similarity * 0.7 + tag_count_ratio * 0.3)
+                jsx_structure_reward = (structure_score - 0.5) * REWARD_STRUCTURE_WEIGHT * 2
+            except:
+                jsx_structure_reward = -0.2 * REWARD_STRUCTURE_WEIGHT
+        elif ref_tags and not gen_tags:
+            jsx_structure_reward = -0.7 * REWARD_STRUCTURE_WEIGHT  # Strong penalty for missing JSX structure
+        elif not ref_tags and not gen_tags:
+            jsx_structure_reward = 0.0
+    except:
+        jsx_structure_reward = 0.0
+    
+    # Combine all rewards
+    total_reward = REWARD_BASE + length_penalty + jsx_bonus + tailwind_reward + jsx_structure_reward
+    
+    return total_reward
 
 def sample_trajectories(sampling_client, tokenizer, prompts):
     trajectories = []
@@ -116,6 +195,7 @@ def sample_trajectories(sampling_client, tokenizer, prompts):
 
 def process_trajectories_for_ppo(trajectories, data, tokenizer):
     processed_data = []
+    reward_stats = {"total": [], "count": 0}
     
     for traj in trajectories:
         generated_text = tokenizer.decode(traj["generated_tokens"])
@@ -127,6 +207,8 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
                 break
         
         reward = compute_code_reward(generated_text, ref_response)
+        reward_stats["total"].append(reward)
+        reward_stats["count"] += 1
         
         all_tokens = traj["prompt_tokens"] + traj["generated_tokens"]
         target_tokens = all_tokens[1:]
@@ -135,9 +217,9 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         old_logprobs = [0.0] * len(traj["prompt_tokens"]) + traj["logprobs"]
         old_logprobs = old_logprobs[1:]
 
+        # Apply full reward to each generated token, zero to prompt tokens
         prompt_length = len(traj["prompt_tokens"]) - 1
-        generated_length = len(traj["generated_tokens"])
-        advantages = [0.0] * prompt_length + [reward / generated_length] * generated_length
+        advantages = [0.0] * prompt_length + [reward] * len(traj["generated_tokens"])
         
         datum = types.Datum(
             model_input=types.ModelInput.from_ints(tokens=input_tokens),
@@ -148,6 +230,13 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
             }
         )
         processed_data.append(datum)
+    
+    # Log reward statistics
+    if reward_stats["total"]:
+        avg_reward = np.mean(reward_stats["total"])
+        min_reward = np.min(reward_stats["total"])
+        max_reward = np.max(reward_stats["total"])
+        print(f"Reward Stats - Avg: {avg_reward:.4f}, Min: {min_reward:.4f}, Max: {max_reward:.4f}")
     
     return processed_data
 
