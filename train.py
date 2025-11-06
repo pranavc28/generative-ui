@@ -20,7 +20,7 @@ VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v2"
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v3"
 
 # Reward Component Weights (adjust based on priorities)
 REWARD_BASE = 1.0               # Base reward for any generation
@@ -37,9 +37,28 @@ def format_react_example(example, idx, tokenizer=None):
     user_message = messages[1]['content'] if len(messages) > 1 else ''
     assistant_response = messages[2]['content'] if len(messages) > 2 else ''
     
+    # Add critical code correctness instructions to the system prompt
+    code_correctness_instructions = """
+
+CRITICAL CODE QUALITY REQUIREMENTS:
+- Ensure ALL variables are properly declared before use (const, let, var)
+- Initialize ALL state variables and hooks correctly
+- Match ALL opening and closing braces, brackets, and parentheses
+- Use proper React hooks syntax (e.g., const [state, setState] = useState(initialValue))
+- Ensure all function parameters are defined
+- Import React if using JSX
+- Close all strings, template literals, and JSX tags properly
+- Define all functions before calling them
+- Use proper TypeScript types and interfaces
+- Export the default component correctly
+
+Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use undefined variables or leave any code incomplete."""
+    
+    enhanced_system_prompt = system_prompt + code_correctness_instructions
+    
     if tokenizer:
         chat_messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": enhanced_system_prompt},
             {"role": "user", "content": user_message}
         ]
         full_prompt = tokenizer.apply_chat_template(
@@ -48,19 +67,20 @@ def format_react_example(example, idx, tokenizer=None):
             add_generation_prompt=True
         )
     else:
-        full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+        full_prompt = f"{enhanced_system_prompt}\n\nUser: {user_message}\n\nAssistant:"
     
     print(f"\n{'='*70}")
     print(f"EXAMPLE {idx}")
     print(f"{'='*70}")
-    print(f"SYSTEM PROMPT:\n{system_prompt}...\n")
+    print(f"SYSTEM PROMPT:\n{system_prompt[:200]}...\n")
+    print(f"ENHANCED WITH CODE QUALITY REQUIREMENTS")
     print(f"USER REQUEST:\n{user_message}\n")
-    print(f"ASSISTANT RESPONSE:\n{assistant_response}\n")
+    print(f"ASSISTANT RESPONSE:\n{assistant_response[:200]}...\n")
     print(f"FULL RESPONSE LENGTH: {len(assistant_response)} chars")
     print(f"{'='*70}")
     
     return {
-        "system_prompt": system_prompt,
+        "system_prompt": enhanced_system_prompt,
         "user_message": user_message,
         "reference_response": assistant_response,
         "full_prompt": full_prompt
