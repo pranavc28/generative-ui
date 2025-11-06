@@ -28,6 +28,7 @@ REWARD_LENGTH_WEIGHT = 0.1      # Weight for length penalty (lower = less import
 REWARD_JSX_BONUS = 0.5          # Bonus for having JSX structure
 REWARD_TAILWIND_WEIGHT = 0.4    # Weight for TailwindCSS similarity (0.4 = moderate importance)
 REWARD_STRUCTURE_WEIGHT = 1.0   # Weight for JSX structure (1.0 = high importance)
+REWARD_VALIDITY_WEIGHT = 2.0    # Weight for code validity (2.0 = very high importance - penalize errors heavily)
 
 def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
@@ -75,12 +76,149 @@ def load_data(tokenizer=None):
     selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
     return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
 
+def check_code_validity(code):
+    """
+    Check for common code errors and return a validity score.
+    Returns a score between -1.0 (very invalid) and 0.0 (valid).
+    Checks for:
+    1. Basic syntax errors (unmatched braces, brackets, parentheses)
+    2. Undefined variables (common React/TS patterns)
+    3. Missing imports for React
+    4. Function/component structure issues
+    """
+    validity_score = 0.0
+    penalties = []
+    
+    # Check 1: Balanced braces, brackets, and parentheses
+    try:
+        brace_count = code.count('{') - code.count('}')
+        bracket_count = code.count('[') - code.count(']')
+        paren_count = code.count('(') - code.count(')')
+        
+        if abs(brace_count) > 0:
+            validity_score -= 0.3
+            penalties.append(f"Unmatched braces: {brace_count}")
+        if abs(bracket_count) > 0:
+            validity_score -= 0.2
+            penalties.append(f"Unmatched brackets: {bracket_count}")
+        if abs(paren_count) > 0:
+            validity_score -= 0.2
+            penalties.append(f"Unmatched parentheses: {paren_count}")
+    except:
+        validity_score -= 0.1
+    
+    # Check 2: Common undefined variable patterns
+    # Look for variables used but not defined (basic heuristic)
+    try:
+        # Extract variable assignments (const, let, var, function parameters)
+        defined_vars = set()
+        
+        # Find variable declarations
+        const_vars = re.findall(r'(?:const|let|var)\s+(\w+)', code)
+        defined_vars.update(const_vars)
+        
+        # Find function declarations
+        func_vars = re.findall(r'function\s+(\w+)', code)
+        defined_vars.update(func_vars)
+        
+        # Find arrow function assignments
+        arrow_vars = re.findall(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:\(|async)', code)
+        defined_vars.update(arrow_vars)
+        
+        # Find function parameters (simplified)
+        params = re.findall(r'(?:function\s+\w+|=>)\s*\(([^)]*)\)', code)
+        for param_list in params:
+            param_names = re.findall(r'(\w+)(?:\s*:|,|$)', param_list)
+            defined_vars.update(param_names)
+        
+        # Check for common React hooks and variables that should exist
+        common_react = {'useState', 'useEffect', 'useCallback', 'useMemo', 'useRef', 'useContext', 
+                        'React', 'props', 'children', 'className', 'style', 'key', 'ref'}
+        defined_vars.update(common_react)
+        
+        # Find variable usages (simplified - look for standalone words that are likely variables)
+        # This is a heuristic and won't catch everything
+        used_vars = re.findall(r'\b([a-z][a-zA-Z0-9]*)\b', code)
+        used_vars = set([v for v in used_vars if not v in ['const', 'let', 'var', 'function', 'return', 
+                                                             'if', 'else', 'for', 'while', 'switch', 
+                                                             'case', 'break', 'continue', 'true', 'false',
+                                                             'null', 'undefined', 'this', 'class', 'export',
+                                                             'import', 'from', 'default', 'async', 'await',
+                                                             'try', 'catch', 'finally', 'throw', 'new',
+                                                             'typeof', 'instanceof', 'in', 'of', 'delete']])
+        
+        # Check for potentially undefined variables
+        potentially_undefined = used_vars - defined_vars
+        
+        # Filter out common valid identifiers
+        valid_identifiers = {'console', 'window', 'document', 'Array', 'Object', 'String', 
+                           'Number', 'Boolean', 'Math', 'Date', 'JSON', 'Promise',
+                           'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+                           'px', 'em', 'rem', 'vh', 'vw'}  # CSS units
+        
+        potentially_undefined = potentially_undefined - valid_identifiers
+        
+        # Penalize if there are many undefined variables (more than 5 could be a problem)
+        if len(potentially_undefined) > 5:
+            validity_score -= 0.3
+            penalties.append(f"Potentially undefined variables: {len(potentially_undefined)}")
+    except Exception as e:
+        validity_score -= 0.05
+        penalties.append(f"Variable analysis error: {str(e)}")
+    
+    # Check 3: Missing React import (for TSX/JSX code)
+    if '<' in code and '>' in code:  # Likely JSX
+        if 'import' not in code.lower() or 'react' not in code.lower():
+            # Missing import statement is less critical in some contexts
+            validity_score -= 0.1
+            penalties.append("Missing React import")
+    
+    # Check 4: Component structure (should have at least a return or export)
+    has_return = 'return' in code.lower()
+    has_export = 'export' in code.lower()
+    
+    if not has_return and not has_export:
+        validity_score -= 0.2
+        penalties.append("Missing return or export statement")
+    
+    # Check 5: Syntax error indicators (unclosed strings, common mistakes)
+    try:
+        # Count quotes (should be even)
+        single_quotes = code.count("'") - code.count("\\'")
+        double_quotes = code.count('"') - code.count('\\"')
+        backticks = code.count('`')
+        
+        if single_quotes % 2 != 0:
+            validity_score -= 0.2
+            penalties.append("Unmatched single quotes")
+        if double_quotes % 2 != 0:
+            validity_score -= 0.2
+            penalties.append("Unmatched double quotes")
+        if backticks % 2 != 0:
+            validity_score -= 0.2
+            penalties.append("Unmatched backticks")
+    except:
+        validity_score -= 0.05
+    
+    # Check 6: Common React/TypeScript errors
+    # Using useState without destructuring
+    if 'useState(' in code and 'const [' not in code and 'const {' not in code:
+        # This might indicate incorrect useState usage
+        validity_score -= 0.1
+        penalties.append("Possible incorrect useState usage")
+    
+    # Clamp score to -1.0 minimum
+    validity_score = max(validity_score, -1.0)
+    
+    return validity_score, penalties
+
 def compute_code_reward(generated_code, reference_code):
     """
-    Compute reward based on three metrics:
+    Compute reward based on four metrics:
     1. JSX presence and length penalty
     2. TailwindCSS class similarity 
     3. JSX structure similarity using simple AST parsing
+    4. Code validity (syntax, undefined variables, etc.)
     """
     gen_len = len(generated_code)
     ref_len = len(reference_code)
@@ -150,8 +288,20 @@ def compute_code_reward(generated_code, reference_code):
     except:
         jsx_structure_reward = 0.0
     
+    # Metric 4: Code validity (syntax errors, undefined variables, etc.)
+    validity_reward = 0.0
+    penalties = []
+    try:
+        validity_score, penalties = check_code_validity(generated_code)
+        # validity_score is between -1.0 (very invalid) and 0.0 (valid)
+        # Scale it by the weight - invalid code gets heavily penalized
+        validity_reward = validity_score * REWARD_VALIDITY_WEIGHT
+    except Exception as e:
+        validity_reward = -0.5 * REWARD_VALIDITY_WEIGHT  # Penalty for analysis failure
+        penalties.append(f"Validity check error: {str(e)}")
+    
     # Combine all rewards
-    total_reward = REWARD_BASE + length_penalty + jsx_bonus + tailwind_reward + jsx_structure_reward
+    total_reward = REWARD_BASE + length_penalty + jsx_bonus + tailwind_reward + jsx_structure_reward + validity_reward
     
     return total_reward
 
@@ -195,7 +345,7 @@ def sample_trajectories(sampling_client, tokenizer, prompts):
 
 def process_trajectories_for_ppo(trajectories, data, tokenizer):
     processed_data = []
-    reward_stats = {"total": [], "count": 0}
+    reward_stats = {"total": [], "count": 0, "validity_issues": []}
     
     for traj in trajectories:
         generated_text = tokenizer.decode(traj["generated_tokens"])
@@ -209,6 +359,18 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         reward = compute_code_reward(generated_text, ref_response)
         reward_stats["total"].append(reward)
         reward_stats["count"] += 1
+        
+        # Check validity and track issues for logging
+        try:
+            validity_score, penalties = check_code_validity(generated_text)
+            if penalties:
+                reward_stats["validity_issues"].append({
+                    "score": validity_score,
+                    "penalties": penalties,
+                    "preview": generated_text[:100] + "..."
+                })
+        except:
+            pass
         
         all_tokens = traj["prompt_tokens"] + traj["generated_tokens"]
         target_tokens = all_tokens[1:]
@@ -237,6 +399,20 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         min_reward = np.min(reward_stats["total"])
         max_reward = np.max(reward_stats["total"])
         print(f"Reward Stats - Avg: {avg_reward:.4f}, Min: {min_reward:.4f}, Max: {max_reward:.4f}")
+        
+        # Log validity issues
+        if reward_stats["validity_issues"]:
+            print(f"\n{'='*70}")
+            print(f"CODE VALIDITY ISSUES DETECTED: {len(reward_stats['validity_issues'])} samples")
+            print(f"{'='*70}")
+            for i, issue in enumerate(reward_stats["validity_issues"][:3]):  # Show first 3
+                print(f"\nIssue {i+1}:")
+                print(f"  Validity Score: {issue['score']:.3f}")
+                print(f"  Penalties: {', '.join(issue['penalties'])}")
+                print(f"  Code Preview: {issue['preview']}")
+            if len(reward_stats["validity_issues"]) > 3:
+                print(f"\n  ... and {len(reward_stats['validity_issues']) - 3} more issues")
+            print(f"{'='*70}\n")
     
     return processed_data
 
