@@ -15,6 +15,7 @@ LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 3
 NUM_SAMPLES_PER_PROMPT = 4
 MAX_GENERATION_TOKENS = 28000  # Qwen3-30B-A3B native context window (can handle full React components)
+GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
@@ -52,7 +53,14 @@ CRITICAL CODE QUALITY REQUIREMENTS:
 - Use proper TypeScript types and interfaces
 - Export the default component correctly
 
-Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use undefined variables or leave any code incomplete."""
+BEFORE RESPONDING, VERIFY:
+✓ All braces, brackets, and parentheses are balanced
+✓ All JSX tags are properly closed
+✓ All variables are defined before use
+✓ The component is complete with proper export
+✓ No syntax errors exist
+
+Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use undefined variables or leave any code incomplete. ALWAYS close all code blocks properly."""
     
     enhanced_system_prompt = system_prompt + code_correctness_instructions
     
@@ -96,7 +104,64 @@ def load_data(tokenizer=None):
     selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
     return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
 
-def check_code_validity(code):
+def extract_valid_identifiers_from_reference(reference_code):
+    """
+    Extract valid identifiers (imports, constants) from reference code.
+    This helps avoid penalizing the generated code for using identifiers 
+    that are imported/defined in the reference.
+    """
+    valid_ids = set()
+    
+    try:
+        # Extract all imports (named and default)
+        # Match: import X from 'Y' or import { A, B } from 'Y' or import * as X from 'Y'
+        import_patterns = [
+            r'import\s+(\w+)\s+from',  # default imports
+            r'import\s+\*\s+as\s+(\w+)\s+from',  # namespace imports
+            r'import\s+{([^}]+)}\s+from',  # named imports
+            r'import\s+(\w+)\s*,\s*{([^}]+)}\s+from',  # mixed imports
+        ]
+        
+        for pattern in import_patterns:
+            matches = re.findall(pattern, reference_code)
+            for match in matches:
+                if isinstance(match, tuple):
+                    for item in match:
+                        # Split by comma for named imports
+                        for name in item.split(','):
+                            # Handle 'as' aliases
+                            if ' as ' in name:
+                                name = name.split(' as ')[-1]
+                            clean_name = name.strip()
+                            if clean_name:
+                                valid_ids.add(clean_name)
+                else:
+                    valid_ids.add(match.strip())
+        
+        # Extract type imports (TypeScript)
+        type_imports = re.findall(r'import\s+type\s+{([^}]+)}\s+from', reference_code)
+        for imports_str in type_imports:
+            for name in imports_str.split(','):
+                if ' as ' in name:
+                    name = name.split(' as ')[-1]
+                clean_name = name.strip()
+                if clean_name:
+                    valid_ids.add(clean_name)
+        
+        # Extract interface and type definitions
+        interfaces = re.findall(r'(?:interface|type)\s+(\w+)', reference_code)
+        valid_ids.update(interfaces)
+        
+        # Extract const/let/var declarations that might be used as constants
+        const_declarations = re.findall(r'(?:const|let|var)\s+(\w+)', reference_code)
+        valid_ids.update(const_declarations)
+        
+    except Exception as e:
+        print(f"Warning: Error extracting identifiers from reference: {e}")
+    
+    return valid_ids
+
+def check_code_validity(code, reference_code=None):
     """
     Check for common code errors and return a validity score.
     Returns a score between -1.0 (very invalid) and 0.0 (valid).
@@ -105,9 +170,30 @@ def check_code_validity(code):
     2. Undefined variables (common React/TS patterns)
     3. Missing imports for React
     4. Function/component structure issues
+    5. Truncated/incomplete code
     """
     validity_score = 0.0
     penalties = []
+    
+    # Check for truncated/incomplete code (new check)
+    is_truncated = False
+    truncation_indicators = [
+        code.count('{') > code.count('}'),  # More opening than closing braces
+        code.rstrip().endswith(','),  # Ends with comma
+        code.rstrip().endswith('('),  # Ends with opening paren
+        code.rstrip().endswith('['),  # Ends with opening bracket
+        not code.rstrip().endswith(('}', ';', '>', ')')),  # Doesn't end properly
+    ]
+    
+    if sum(truncation_indicators) >= 2:  # Multiple indicators suggest truncation
+        is_truncated = True
+        validity_score -= 0.5
+        penalties.append("Code appears truncated/incomplete")
+    
+    # Extract valid identifiers from reference code if provided
+    reference_identifiers = set()
+    if reference_code:
+        reference_identifiers = extract_valid_identifiers_from_reference(reference_code)
     
     # Check 1: Balanced braces, brackets, and parentheses
     try:
@@ -156,6 +242,9 @@ def check_code_validity(code):
                         'React', 'props', 'children', 'className', 'style', 'key', 'ref'}
         defined_vars.update(common_react)
         
+        # Add identifiers from reference code (imports, constants, etc.)
+        defined_vars.update(reference_identifiers)
+        
         # Find variable usages (simplified - look for standalone words that are likely variables)
         # This is a heuristic and won't catch everything
         used_vars = re.findall(r'\b([a-z][a-zA-Z0-9]*)\b', code)
@@ -174,7 +263,7 @@ def check_code_validity(code):
         valid_identifiers = {'console', 'window', 'document', 'Array', 'Object', 'String', 
                            'Number', 'Boolean', 'Math', 'Date', 'JSON', 'Promise',
                            'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-                           'px', 'em', 'rem', 'vh', 'vw'}  # CSS units
+                           'px', 'em', 'rem', 'vh', 'vw', 'FC', 'ReactNode', 'ReactElement'}  # CSS units + React types
         
         potentially_undefined = potentially_undefined - valid_identifiers
         
@@ -187,11 +276,15 @@ def check_code_validity(code):
         penalties.append(f"Variable analysis error: {str(e)}")
     
     # Check 3: Missing React import (for TSX/JSX code)
+    # Only penalize if reference doesn't have imports either (be lenient about imports)
     if '<' in code and '>' in code:  # Likely JSX
-        if 'import' not in code.lower() or 'react' not in code.lower():
-            # Missing import statement is less critical in some contexts
-            validity_score -= 0.1
-            penalties.append("Missing React import")
+        has_imports = 'import' in code.lower()
+        reference_has_imports = reference_code and 'import' in reference_code.lower()
+        
+        # Only penalize if generated has no imports but reference does
+        if not has_imports and reference_has_imports:
+            validity_score -= 0.05  # Reduced penalty
+            penalties.append("Missing imports (present in reference)")
     
     # Check 4: Component structure (should have at least a return or export)
     has_return = 'return' in code.lower()
@@ -312,7 +405,7 @@ def compute_code_reward(generated_code, reference_code):
     validity_reward = 0.0
     penalties = []
     try:
-        validity_score, penalties = check_code_validity(generated_code)
+        validity_score, penalties = check_code_validity(generated_code, reference_code)
         # validity_score is between -1.0 (very invalid) and 0.0 (valid)
         # Scale it by the weight - invalid code gets heavily penalized
         validity_reward = validity_score * REWARD_VALIDITY_WEIGHT
@@ -332,7 +425,7 @@ def sample_trajectories(sampling_client, tokenizer, prompts):
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.7, 
         top_p=0.9,
-        stop=[]
+        stop=GENERATION_STOP_SEQUENCES  # Use stop sequences to detect completion
     )
     
     for prompt_text in prompts:
@@ -382,7 +475,7 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
         
         # Check validity and track issues for logging
         try:
-            validity_score, penalties = check_code_validity(generated_text)
+            validity_score, penalties = check_code_validity(generated_text, ref_response)
             if penalties:
                 reward_stats["validity_issues"].append({
                     "score": validity_score,
@@ -499,7 +592,7 @@ def evaluate(sampling_client, tokenizer, data):
     params = types.SamplingParams(
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.0, 
-        stop=[]  # Match training: no stop sequences
+        stop=GENERATION_STOP_SEQUENCES  # Use stop sequences to detect completion
     )
     
     for idx, example in enumerate(data):
