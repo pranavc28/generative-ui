@@ -25,36 +25,39 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import CountVectorizer
 
 DATASET_NAME = "cfahlgren1/react-code-instructions"
-NUM_EXAMPLES = 20  # Start small for testing, scale to 60+ for full training
+NUM_EXAMPLES = 600  # INCREASED: 20 was too small, need more diverse training data
+NUM_EVAL_EXAMPLES = 10  # Evaluate on subset for faster feedback (600 would take too long)
 BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
-NUM_PPO_EPOCHS = 3
-NUM_SAMPLES_PER_PROMPT = 2  # Start with 2 for speed, increase to 4+ for better training
-MAX_GENERATION_TOKENS = 12288  # Increased to 12k: eval showed 40% truncation at 8192. Components avg 9k tokens.
+NUM_PPO_EPOCHS = 5  # INCREASED: More epochs for better convergence
+NUM_SAMPLES_PER_PROMPT = 4  # INCREASED: More samples for better exploration and policy gradients
+MAX_GENERATION_TOKENS = 20480  # INCREASED: 12k still caused 20% truncation, now ~67% higher
 GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v4"
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v5"  # v5: 3x data, 2x samples, stronger rewards, quote validation
 
 # Simplified Reward System - Focus on Core Quality
 # 
 # Philosophy: Keep it simple! PPO learns best with clear, strong signals.
 # Start with fundamentals, add complexity later if needed.
 #
-# Phase 1: Get basic code generation working
+# Phase 2: Improve code quality after C-grade results (60% valid)
 REWARD_BASE = 1.0                      # Base reward
-REWARD_COMPLETENESS_WEIGHT = 10.0      # CRITICAL: Code must be complete (not truncated) - DOUBLED!
-REWARD_VALIDITY_WEIGHT = 4.0           # IMPORTANT: Basic syntax validity (balanced braces) - DOUBLED!
+REWARD_COMPLETENESS_WEIGHT = 15.0      # CRITICAL: Code must be complete (not truncated) - INCREASED 50%!
+REWARD_VALIDITY_WEIGHT = 6.0           # IMPORTANT: Basic syntax validity (balanced braces) - INCREASED 50%!
+REWARD_QUOTE_WEIGHT = 4.0              # NEW: Balanced quotes (30% of errors were quote issues)
 REWARD_LENGTH_PENALTY_WEIGHT = 0.1     # MINOR: Encourage reasonable length
 #
-# Eval results (C grade): 60% complete, 55% balanced braces
-# → Increased weights to provide stronger learning signals
+# Eval v4 results (C grade): 60% valid, 40% invalid
+# Issues: 20% truncation, 30% quote mismatches, 20% structural errors
+# → Further increased weights and added quote-specific reward
 #
 # Removed (for now): TailwindCSS similarity, JSX structure analysis, 
-# undefined variable detection. Add these back in Phase 2 if needed.
+# undefined variable detection. Add these back in Phase 3 if needed.
 
 def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
@@ -338,8 +341,9 @@ def compute_code_reward(generated_code, reference_code):
     """
     SIMPLIFIED REWARD FUNCTION - Focus on Core Quality:
     1. Code completeness (not truncated) - CRITICAL
-    2. Basic validity (balanced braces) - IMPORTANT  
-    3. Reasonable length - MINOR
+    2. Basic validity (balanced braces, brackets, parens) - IMPORTANT  
+    3. Quote balancing (NEW) - IMPORTANT (30% of errors)
+    4. Reasonable length - MINOR
     """
     gen_len = len(generated_code)
     ref_len = len(reference_code)
@@ -360,7 +364,7 @@ def compute_code_reward(generated_code, reference_code):
         # Code is complete - REWARD this!
         completeness_reward = 0.5 * REWARD_COMPLETENESS_WEIGHT
     
-    # IMPORTANT: Basic validity checks
+    # IMPORTANT: Basic validity checks (braces, brackets, parentheses)
     validity_reward = 0.0
     
     # Check balanced braces
@@ -369,15 +373,51 @@ def compute_code_reward(generated_code, reference_code):
     else:
         validity_reward -= 0.5 * REWARD_VALIDITY_WEIGHT
     
+    # Check balanced brackets
+    if generated_code.count('[') == generated_code.count(']'):
+        validity_reward += 0.15 * REWARD_VALIDITY_WEIGHT
+    else:
+        validity_reward -= 0.25 * REWARD_VALIDITY_WEIGHT
+    
+    # Check balanced parentheses
+    if generated_code.count('(') == generated_code.count(')'):
+        validity_reward += 0.15 * REWARD_VALIDITY_WEIGHT
+    else:
+        validity_reward -= 0.25 * REWARD_VALIDITY_WEIGHT
+    
     # Check has return statement (basic React component requirement)
     if 'return' in generated_code.lower():
         validity_reward += 0.2 * REWARD_VALIDITY_WEIGHT
+    
+    # NEW: Quote balancing reward (30% of eval errors were quote issues)
+    quote_reward = 0.0
+    
+    # Check balanced single quotes (excluding escaped ones)
+    single_quotes = generated_code.count("'") - generated_code.count("\\'")
+    if single_quotes % 2 == 0:
+        quote_reward += 0.4 * REWARD_QUOTE_WEIGHT
+    else:
+        quote_reward -= 0.6 * REWARD_QUOTE_WEIGHT
+    
+    # Check balanced double quotes (excluding escaped ones)
+    double_quotes = generated_code.count('"') - generated_code.count('\\"')
+    if double_quotes % 2 == 0:
+        quote_reward += 0.3 * REWARD_QUOTE_WEIGHT
+    else:
+        quote_reward -= 0.5 * REWARD_QUOTE_WEIGHT
+    
+    # Check balanced backticks (template literals)
+    backticks = generated_code.count('`')
+    if backticks % 2 == 0:
+        quote_reward += 0.3 * REWARD_QUOTE_WEIGHT
+    else:
+        quote_reward -= 0.5 * REWARD_QUOTE_WEIGHT
     
     # MINOR: Length penalty (don't deviate too much from reference)
     length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * REWARD_LENGTH_PENALTY_WEIGHT
     
     # Combine all rewards
-    total_reward = REWARD_BASE + completeness_reward + validity_reward + length_penalty
+    total_reward = REWARD_BASE + completeness_reward + validity_reward + quote_reward + length_penalty
     
     return total_reward
 
@@ -495,7 +535,8 @@ async def train_ppo():
     
     print(f"\n{'='*70}")
     print(f"PPO TRAINING: {BASE_MODEL}")
-    print(f"Examples: {len(data)} | Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE}")
+    print(f"Training Examples: {len(data)} | Eval Examples: {NUM_EVAL_EXAMPLES}")
+    print(f"Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE}")
     print(f"Samples/Prompt: {NUM_SAMPLES_PER_PROMPT} | Max Tokens: {MAX_GENERATION_TOKENS}")
     print(f"Total samples per epoch: {len(data) * NUM_SAMPLES_PER_PROMPT}")
     print(f"{'='*70}\n")
@@ -545,8 +586,11 @@ async def train_ppo():
     return sampling_client, tokenizer, data
 
 async def evaluate(sampling_client, tokenizer, data):
+    # Limit evaluation to NUM_EVAL_EXAMPLES for faster feedback
+    eval_data = data[:NUM_EVAL_EXAMPLES]
+    
     print(f"\n{'='*70}")
-    print(f"EVALUATION - {len(data)} examples")
+    print(f"EVALUATION - {len(eval_data)} examples (sampled from {len(data)} total)")
     print(f"{'='*70}")
     results = []
     
@@ -560,7 +604,7 @@ async def evaluate(sampling_client, tokenizer, data):
     coroutines = []
     contexts = []
     
-    for idx, example in enumerate(data):
+    for idx, example in enumerate(eval_data):
         prompt_text = example["full_prompt"]
         prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
         
