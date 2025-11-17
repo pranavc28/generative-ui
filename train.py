@@ -1,6 +1,21 @@
+"""
+PPO Training with Asynchronous Grouped Policy Training (Tinker API)
+
+This implementation uses async sampling and processing for improved efficiency:
+1. sample_async() launches all sampling requests asynchronously
+2. Trajectories are processed and rewards computed as samples complete
+3. forward_backward_async() and optim_step_async() overlap computation
+4. Evaluation also uses async sampling for faster inference
+
+This approach provides:
+- Immediate feedback as samples complete
+- Better GPU utilization through overlapping compute
+- Faster training iterations compared to synchronous batching
+"""
 import os
 import json
 import re
+import asyncio
 import numpy as np
 import tinker
 from tinker import types
@@ -9,19 +24,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import CountVectorizer
 
 DATASET_NAME = "cfahlgren1/react-code-instructions"
-NUM_EXAMPLES = 5  # Increased for better generalization -> freshbeer was here
+NUM_EXAMPLES = 60  # Increased for better generalization -> freshbeer was here
 BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 3
 NUM_SAMPLES_PER_PROMPT = 4
-MAX_GENERATION_TOKENS = 28000  # Qwen3-30B-A3B native context window (can handle full React components)
+MAX_GENERATION_TOKENS = 20000  # Max tokens for generation (32768 context - ~11k prompt = ~21k available)
 GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v3"
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v4"
 
 # Reward Component Weights (adjust based on priorities)
 REWARD_BASE = 1.0               # Base reward for any generation
@@ -76,16 +91,6 @@ Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use 
         )
     else:
         full_prompt = f"{enhanced_system_prompt}\n\nUser: {user_message}\n\nAssistant:"
-    
-    print(f"\n{'='*70}")
-    print(f"EXAMPLE {idx}")
-    print(f"{'='*70}")
-    print(f"SYSTEM PROMPT:\n{system_prompt[:200]}...\n")
-    print(f"ENHANCED WITH CODE QUALITY REQUIREMENTS")
-    print(f"USER REQUEST:\n{user_message}\n")
-    print(f"ASSISTANT RESPONSE:\n{assistant_response[:200]}...\n")
-    print(f"FULL RESPONSE LENGTH: {len(assistant_response)} chars")
-    print(f"{'='*70}")
     
     return {
         "system_prompt": enhanced_system_prompt,
@@ -418,27 +423,55 @@ def compute_code_reward(generated_code, reference_code):
     
     return total_reward
 
-def sample_trajectories(sampling_client, tokenizer, prompts):
-    trajectories = []
-    
+async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
+    """
+    Asynchronous sampling that processes trajectories as they complete.
+    Returns processed data ready for PPO update.
+    """
     params = types.SamplingParams(
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.7, 
         top_p=0.9,
-        stop=GENERATION_STOP_SEQUENCES  # Use stop sequences to detect completion
+        stop=GENERATION_STOP_SEQUENCES
     )
+    
+    # Prepare all sampling requests with context
+    contexts = []
+    coroutines = []
     
     for prompt_text in prompts:
         prompt_tokens = tokenizer.encode(prompt_text)
         prompt_input = types.ModelInput.from_ints(prompt_tokens)
         
-        future = sampling_client.sample(
+        # Find reference response for reward computation
+        ref_response = ""
+        for ex in data:
+            if ex["full_prompt"] == prompt_text:
+                ref_response = ex["reference_response"]
+                break
+        
+        # sample_async returns a coroutine that needs to be awaited
+        coro = sampling_client.sample_async(
             prompt=prompt_input, 
             sampling_params=params, 
             num_samples=NUM_SAMPLES_PER_PROMPT
         )
-        result = future.result()
         
+        coroutines.append(coro)
+        contexts.append({
+            "prompt_tokens": prompt_tokens,
+            "prompt_text": prompt_text,
+            "ref_response": ref_response
+        })
+    
+    # Launch ALL sampling requests concurrently using asyncio.gather
+    results = await asyncio.gather(*coroutines)
+    
+    # Process all results
+    processed_data = []
+    reward_stats = {"total": [], "count": 0, "validity_issues": []}
+        
+        # Process each sample in the batch
         for seq in result.sequences:
             generated_tokens = seq.tokens
             if seq.logprobs is None:
@@ -447,64 +480,46 @@ def sample_trajectories(sampling_client, tokenizer, prompts):
             else:
                 logprobs = seq.logprobs
             
-            trajectories.append({
-                "prompt_tokens": prompt_tokens,
-                "generated_tokens": generated_tokens,
-                "logprobs": logprobs,
-                "prompt_text": prompt_text
-            })
-    
-    return trajectories
-
-def process_trajectories_for_ppo(trajectories, data, tokenizer):
-    processed_data = []
-    reward_stats = {"total": [], "count": 0, "validity_issues": []}
-    
-    for traj in trajectories:
-        generated_text = tokenizer.decode(traj["generated_tokens"])
-        
-        ref_response = ""
-        for ex in data:
-            if ex["full_prompt"] == traj["prompt_text"]:
-                ref_response = ex["reference_response"]
-                break
-        
-        reward = compute_code_reward(generated_text, ref_response)
-        reward_stats["total"].append(reward)
-        reward_stats["count"] += 1
-        
-        # Check validity and track issues for logging
-        try:
-            validity_score, penalties = check_code_validity(generated_text, ref_response)
-            if penalties:
-                reward_stats["validity_issues"].append({
-                    "score": validity_score,
-                    "penalties": penalties,
-                    "preview": generated_text[:100] + "..."
-                })
-        except:
-            pass
-        
-        all_tokens = traj["prompt_tokens"] + traj["generated_tokens"]
-        target_tokens = all_tokens[1:]
-        input_tokens = all_tokens[:-1]
-
-        old_logprobs = [0.0] * len(traj["prompt_tokens"]) + traj["logprobs"]
-        old_logprobs = old_logprobs[1:]
-
-        # Apply full reward to each generated token, zero to prompt tokens
-        prompt_length = len(traj["prompt_tokens"]) - 1
-        advantages = [0.0] * prompt_length + [reward] * len(traj["generated_tokens"])
-        
-        datum = types.Datum(
-            model_input=types.ModelInput.from_ints(tokens=input_tokens),
-            loss_fn_inputs={
-                "target_tokens": target_tokens,
-                "logprobs": old_logprobs,
-                "advantages": advantages
-            }
-        )
-        processed_data.append(datum)
+            # Decode and compute reward immediately
+            generated_text = tokenizer.decode(generated_tokens)
+            reward = compute_code_reward(generated_text, ctx["ref_response"])
+            
+            reward_stats["total"].append(reward)
+            reward_stats["count"] += 1
+            
+            # Check validity and track issues
+            try:
+                validity_score, penalties = check_code_validity(generated_text, ctx["ref_response"])
+                if penalties:
+                    reward_stats["validity_issues"].append({
+                        "score": validity_score,
+                        "penalties": penalties,
+                        "preview": generated_text[:100] + "..."
+                    })
+            except:
+                pass
+            
+            # Create PPO datum
+            all_tokens = ctx["prompt_tokens"] + generated_tokens
+            target_tokens = all_tokens[1:]
+            input_tokens = all_tokens[:-1]
+            
+            old_logprobs = [0.0] * len(ctx["prompt_tokens"]) + logprobs
+            old_logprobs = old_logprobs[1:]
+            
+            # Apply full reward to each generated token, zero to prompt tokens
+            prompt_length = len(ctx["prompt_tokens"]) - 1
+            advantages = [0.0] * prompt_length + [reward] * len(generated_tokens)
+            
+            datum = types.Datum(
+                model_input=types.ModelInput.from_ints(tokens=input_tokens),
+                loss_fn_inputs={
+                    "target_tokens": target_tokens,
+                    "logprobs": old_logprobs,
+                    "advantages": advantages
+                }
+            )
+            processed_data.append(datum)
     
     # Log reward statistics
     if reward_stats["total"]:
@@ -518,7 +533,7 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
             print(f"\n{'='*70}")
             print(f"CODE VALIDITY ISSUES DETECTED: {len(reward_stats['validity_issues'])} samples")
             print(f"{'='*70}")
-            for i, issue in enumerate(reward_stats["validity_issues"][:3]):  # Show first 3
+            for i, issue in enumerate(reward_stats["validity_issues"][:3]):
                 print(f"\nIssue {i+1}:")
                 print(f"  Validity Score: {issue['score']:.3f}")
                 print(f"  Penalties: {', '.join(issue['penalties'])}")
@@ -529,9 +544,10 @@ def process_trajectories_for_ppo(trajectories, data, tokenizer):
     
     return processed_data
 
-def train_ppo():
+
+async def train_ppo():
     service_client = tinker.ServiceClient()
-    training_client = service_client.create_lora_training_client(base_model=BASE_MODEL)
+    training_client = await service_client.create_lora_training_client_async(base_model=BASE_MODEL)
     
     tokenizer = training_client.get_tokenizer()
 
@@ -558,19 +574,24 @@ def train_ppo():
         sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
         
         prompts = [ex["full_prompt"] for ex in data]
-        print(f"Sampling {NUM_SAMPLES_PER_PROMPT} trajectories per prompt...")
-        trajectories = sample_trajectories(sampling_client, tokenizer, prompts)
-        print(f"Generated {len(trajectories)} total trajectories")
+        print(f"Launching async sampling for {len(prompts)} prompts with {NUM_SAMPLES_PER_PROMPT} samples each...")
         
-        print(f"Processing trajectories for PPO update...")
-        processed_examples = process_trajectories_for_ppo(trajectories, data, tokenizer)
+        # Async sampling with immediate trajectory processing
+        processed_examples = await sample_trajectories_async(sampling_client, tokenizer, prompts, data)
+        print(f"Processed {len(processed_examples)} trajectories for PPO update")
         
-        fwdbwd_future = training_client.forward_backward(processed_examples, "ppo")
-        optim_future = training_client.optim_step(
+        # Launch forward/backward and optimizer step asynchronously to overlap computation
+        print(f"Launching async forward/backward pass...")
+        fwdbwd_coro = training_client.forward_backward_async(processed_examples, "ppo")
+        
+        print(f"Launching async optimizer step...")
+        optim_coro = training_client.optim_step_async(
             types.AdamParams(learning_rate=LEARNING_RATE)
         )
         
-        fwdbwd_result = fwdbwd_future.result()
+        # Wait for both to complete (they overlap internally)
+        print(f"Waiting for forward/backward and optimizer to complete...")
+        fwdbwd_result, optim_result = await asyncio.gather(fwdbwd_coro, optim_coro)
         
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
         avg_logprob = np.mean(logprobs)
@@ -583,7 +604,7 @@ def train_ppo():
     
     return sampling_client, tokenizer, data
 
-def evaluate(sampling_client, tokenizer, data):
+async def evaluate(sampling_client, tokenizer, data):
     print(f"\n{'='*70}")
     print("EVALUATION")
     print(f"{'='*70}")
@@ -592,22 +613,40 @@ def evaluate(sampling_client, tokenizer, data):
     params = types.SamplingParams(
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.0, 
-        stop=GENERATION_STOP_SEQUENCES  # Use stop sequences to detect completion
+        stop=GENERATION_STOP_SEQUENCES
     )
+    
+    # Prepare all evaluation samples
+    coroutines = []
+    contexts = []
     
     for idx, example in enumerate(data):
         prompt_text = example["full_prompt"]
+        prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
+        
+        coro = sampling_client.sample_async(prompt=prompt, sampling_params=params, num_samples=1)
+        coroutines.append(coro)
+        contexts.append({
+            "idx": idx,
+            "example": example
+        })
+    
+    # Launch ALL evaluation samples concurrently
+    print(f"Launching {len(coroutines)} evaluation samples concurrently...")
+    eval_results = await asyncio.gather(*coroutines)
+    print(f"All {len(eval_results)} evaluation samples completed!")
+    
+    # Process all results
+    for eval_result, ctx in zip(eval_results, contexts):
+        idx = ctx["idx"]
+        example = ctx["example"]
         expected_response = example["reference_response"]
         user_message = example["user_message"]
         
         print(f"\n--- Evaluating Example {idx} ---")
-        print(f"User Request: {user_message}...")
+        print(f"User Request: {user_message[:100]}...")
         
-        prompt = types.ModelInput.from_ints(tokenizer.encode(prompt_text))
-        future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
-        result = future.result()
-        
-        predicted = tokenizer.decode(result.sequences[0].tokens).strip()
+        predicted = tokenizer.decode(eval_result.sequences[0].tokens).strip()
         
         has_code = "function" in predicted or "const" in predicted or "return" in predicted
         
@@ -623,7 +662,7 @@ def evaluate(sampling_client, tokenizer, data):
         print(f"Expected length: {len(expected_response)} chars")
         print(f"Generated length: {len(predicted)} chars")
         print(f"Has code structure: {has_code}")
-        print(f"Generated code preview:\n{predicted}...")
+        print(f"Generated code preview:\n{predicted[:200]}...")
     
     with open(f"{OUTPUT_DIR}/eval_results.jsonl", "w") as f:
         for r in results:
@@ -640,7 +679,11 @@ def evaluate(sampling_client, tokenizer, data):
     
     return results
 
+async def main():
+    """Main async entry point for training and evaluation."""
+    sampling_client, tokenizer, data = await train_ppo()
+    await evaluate(sampling_client, tokenizer, data)
+
 if __name__ == "__main__":
-    sampling_client, tokenizer, data = train_ppo()
-    evaluate(sampling_client, tokenizer, data)
+    asyncio.run(main())
 
