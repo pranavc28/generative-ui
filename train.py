@@ -16,6 +16,7 @@ import os
 import json
 import re
 import asyncio
+import time
 import numpy as np
 import tinker
 from tinker import types
@@ -24,12 +25,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import CountVectorizer
 
 DATASET_NAME = "cfahlgren1/react-code-instructions"
-NUM_EXAMPLES = 60  # Increased for better generalization -> freshbeer was here
+NUM_EXAMPLES = 20  # Start small for testing, scale to 60+ for full training
 BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 3
-NUM_SAMPLES_PER_PROMPT = 4
-MAX_GENERATION_TOKENS = 20000  # Max tokens for generation (32768 context - ~11k prompt = ~21k available)
+NUM_SAMPLES_PER_PROMPT = 2  # Start with 2 for speed, increase to 4+ for better training
+MAX_GENERATION_TOKENS = 12288  # Increased to 12k: eval showed 40% truncation at 8192. Components avg 9k tokens.
 GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
@@ -38,13 +39,22 @@ ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
 CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v4"
 
-# Reward Component Weights (adjust based on priorities)
-REWARD_BASE = 1.0               # Base reward for any generation
-REWARD_LENGTH_WEIGHT = 0.1      # Weight for length penalty (lower = less important)
-REWARD_JSX_BONUS = 0.5          # Bonus for having JSX structure
-REWARD_TAILWIND_WEIGHT = 0.4    # Weight for TailwindCSS similarity (0.4 = moderate importance)
-REWARD_STRUCTURE_WEIGHT = 1.0   # Weight for JSX structure (1.0 = high importance)
-REWARD_VALIDITY_WEIGHT = 2.0    # Weight for code validity (2.0 = very high importance - penalize errors heavily)
+# Simplified Reward System - Focus on Core Quality
+# 
+# Philosophy: Keep it simple! PPO learns best with clear, strong signals.
+# Start with fundamentals, add complexity later if needed.
+#
+# Phase 1: Get basic code generation working
+REWARD_BASE = 1.0                      # Base reward
+REWARD_COMPLETENESS_WEIGHT = 10.0      # CRITICAL: Code must be complete (not truncated) - DOUBLED!
+REWARD_VALIDITY_WEIGHT = 4.0           # IMPORTANT: Basic syntax validity (balanced braces) - DOUBLED!
+REWARD_LENGTH_PENALTY_WEIGHT = 0.1     # MINOR: Encourage reasonable length
+#
+# Eval results (C grade): 60% complete, 55% balanced braces
+# → Increased weights to provide stronger learning signals
+#
+# Removed (for now): TailwindCSS similarity, JSX structure analysis, 
+# undefined variable detection. Add these back in Phase 2 if needed.
 
 def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
@@ -175,20 +185,19 @@ def check_code_validity(code, reference_code=None):
     validity_score = 0.0
     penalties = []
     
-    # Check for truncated/incomplete code (new check)
+    # Check for truncated/incomplete code (CRITICAL for quality)
     is_truncated = False
     truncation_indicators = [
         code.count('{') > code.count('}'),  # More opening than closing braces
-        code.rstrip().endswith(','),  # Ends with comma
-        code.rstrip().endswith('('),  # Ends with opening paren
-        code.rstrip().endswith('['),  # Ends with opening bracket
-        not code.rstrip().endswith(('}', ';', '>', ')')),  # Doesn't end properly
+        code.count('[') > code.count(']'),  # Unbalanced brackets
+        code.rstrip().endswith((',', '(', '[', '{', '<')),  # Ends with opening token
+        not code.rstrip().endswith(('}', ';', '>', ')', '`', '"', "'")),  # Doesn't end properly
     ]
     
     if sum(truncation_indicators) >= 2:  # Multiple indicators suggest truncation
         is_truncated = True
-        validity_score -= 0.5
-        penalties.append("Code appears truncated/incomplete")
+        validity_score -= 1.5  # HEAVY penalty for truncation
+        penalties.append("Code is truncated/incomplete - CRITICAL ERROR")
     
     # Extract valid identifiers from reference code if provided
     reference_identifiers = set()
@@ -327,94 +336,48 @@ def check_code_validity(code, reference_code=None):
 
 def compute_code_reward(generated_code, reference_code):
     """
-    Compute reward based on four metrics:
-    1. JSX presence and length penalty
-    2. TailwindCSS class similarity 
-    3. JSX structure similarity using simple AST parsing
-    4. Code validity (syntax, undefined variables, etc.)
+    SIMPLIFIED REWARD FUNCTION - Focus on Core Quality:
+    1. Code completeness (not truncated) - CRITICAL
+    2. Basic validity (balanced braces) - IMPORTANT  
+    3. Reasonable length - MINOR
     """
     gen_len = len(generated_code)
     ref_len = len(reference_code)
     
-    # Metric 1: JSX presence and length penalty
-    has_jsx = "return" in generated_code.lower() and ("<" in generated_code or "/>" in generated_code)
-    length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * REWARD_LENGTH_WEIGHT
-    jsx_bonus = REWARD_JSX_BONUS if has_jsx else 0.0
+    # CRITICAL: Check if code is complete (not truncated)
+    completeness_reward = 0.0
+    truncation_indicators = [
+        generated_code.count('{') != generated_code.count('}'),
+        generated_code.count('[') != generated_code.count(']'),
+        generated_code.rstrip().endswith((',', '(', '[', '{', '<')),
+        not generated_code.rstrip().endswith(('}', ';', '>', ')', '`', '"', "'")),
+    ]
     
-    # Metric 2: TailwindCSS similarity using cosine similarity
-    tailwind_reward = 0.0
-    try:
-        # Extract className attributes from both codes
-        gen_classes = re.findall(r'className=["\']([^"\']+)["\']', generated_code)
-        ref_classes = re.findall(r'className=["\']([^"\']+)["\']', reference_code)
-        
-        if gen_classes and ref_classes:
-            # Flatten all classes into single strings
-            gen_tailwind = ' '.join(gen_classes)
-            ref_tailwind = ' '.join(ref_classes)
-            
-            # Use CountVectorizer for simple token-based similarity
-            vectorizer = CountVectorizer()
-            try:
-                vectors = vectorizer.fit_transform([ref_tailwind, gen_tailwind])
-                similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
-                # Convert similarity (0-1) to reward/penalty scaled by weight
-                tailwind_reward = (similarity - 0.5) * REWARD_TAILWIND_WEIGHT * 2
-            except:
-                tailwind_reward = -0.2 * REWARD_TAILWIND_WEIGHT  # Penalty if vectorization fails
-        elif ref_classes and not gen_classes:
-            tailwind_reward = -0.5 * REWARD_TAILWIND_WEIGHT  # Penalty for missing TailwindCSS when expected
-        elif not ref_classes and not gen_classes:
-            tailwind_reward = 0.0  # Neutral if neither has Tailwind
-    except:
-        tailwind_reward = 0.0
+    if sum(truncation_indicators) >= 2:
+        # Code is truncated - HEAVY penalty
+        completeness_reward = -1.0 * REWARD_COMPLETENESS_WEIGHT
+    else:
+        # Code is complete - REWARD this!
+        completeness_reward = 0.5 * REWARD_COMPLETENESS_WEIGHT
     
-    # Metric 3: JSX structure similarity using simple tree-based comparison
-    jsx_structure_reward = 0.0
-    try:
-        # Extract JSX tags (simplified AST approach without tree-sitter)
-        gen_tags = re.findall(r'<(\w+)[\s>]', generated_code)
-        ref_tags = re.findall(r'<(\w+)[\s>]', reference_code)
-        
-        if gen_tags and ref_tags:
-            # Create tag frequency distributions
-            gen_tag_str = ' '.join(gen_tags)
-            ref_tag_str = ' '.join(ref_tags)
-            
-            vectorizer = CountVectorizer()
-            try:
-                vectors = vectorizer.fit_transform([ref_tag_str, gen_tag_str])
-                tag_similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
-                
-                # Also check tag count similarity
-                tag_count_ratio = min(len(gen_tags), len(ref_tags)) / max(len(gen_tags), len(ref_tags), 1)
-                
-                # Combined structure reward (70% tag similarity + 30% count ratio)
-                structure_score = (tag_similarity * 0.7 + tag_count_ratio * 0.3)
-                jsx_structure_reward = (structure_score - 0.5) * REWARD_STRUCTURE_WEIGHT * 2
-            except:
-                jsx_structure_reward = -0.2 * REWARD_STRUCTURE_WEIGHT
-        elif ref_tags and not gen_tags:
-            jsx_structure_reward = -0.7 * REWARD_STRUCTURE_WEIGHT  # Strong penalty for missing JSX structure
-        elif not ref_tags and not gen_tags:
-            jsx_structure_reward = 0.0
-    except:
-        jsx_structure_reward = 0.0
-    
-    # Metric 4: Code validity (syntax errors, undefined variables, etc.)
+    # IMPORTANT: Basic validity checks
     validity_reward = 0.0
-    penalties = []
-    try:
-        validity_score, penalties = check_code_validity(generated_code, reference_code)
-        # validity_score is between -1.0 (very invalid) and 0.0 (valid)
-        # Scale it by the weight - invalid code gets heavily penalized
-        validity_reward = validity_score * REWARD_VALIDITY_WEIGHT
-    except Exception as e:
-        validity_reward = -0.5 * REWARD_VALIDITY_WEIGHT  # Penalty for analysis failure
-        penalties.append(f"Validity check error: {str(e)}")
+    
+    # Check balanced braces
+    if generated_code.count('{') == generated_code.count('}'):
+        validity_reward += 0.3 * REWARD_VALIDITY_WEIGHT
+    else:
+        validity_reward -= 0.5 * REWARD_VALIDITY_WEIGHT
+    
+    # Check has return statement (basic React component requirement)
+    if 'return' in generated_code.lower():
+        validity_reward += 0.2 * REWARD_VALIDITY_WEIGHT
+    
+    # MINOR: Length penalty (don't deviate too much from reference)
+    length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * REWARD_LENGTH_PENALTY_WEIGHT
     
     # Combine all rewards
-    total_reward = REWARD_BASE + length_penalty + jsx_bonus + tailwind_reward + jsx_structure_reward + validity_reward
+    total_reward = REWARD_BASE + completeness_reward + validity_reward + length_penalty
     
     return total_reward
 
@@ -460,11 +423,15 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         })
     
     # Launch ALL sampling requests concurrently using asyncio.gather
+    print(f"      🚀 Launching {len(coroutines)} concurrent sampling requests...")
+    sample_start = time.time()
     results = await asyncio.gather(*coroutines)
+    sample_time = time.time() - sample_start
+    print(f"      ✅ All samples completed in {sample_time:.1f}s ({sample_time/len(coroutines):.2f}s per prompt)")
     
     # Process all results
     processed_data = []
-    reward_stats = {"total": [], "count": 0, "validity_issues": []}
+    reward_stats = {"total": [], "count": 0}
     
     for idx, (result, ctx) in enumerate(zip(results, contexts)):
         # Process each sample in the batch
@@ -482,18 +449,6 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             
             reward_stats["total"].append(reward)
             reward_stats["count"] += 1
-            
-            # Check validity and track issues
-            try:
-                validity_score, penalties = check_code_validity(generated_text, ctx["ref_response"])
-                if penalties:
-                    reward_stats["validity_issues"].append({
-                        "score": validity_score,
-                        "penalties": penalties,
-                        "preview": generated_text[:100] + "..."
-                    })
-            except:
-                pass
             
             # Create PPO datum
             all_tokens = ctx["prompt_tokens"] + generated_tokens
@@ -522,8 +477,8 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         avg_reward = np.mean(reward_stats["total"])
         min_reward = np.min(reward_stats["total"])
         max_reward = np.max(reward_stats["total"])
-        num_validity_issues = len(reward_stats["validity_issues"])
-        print(f"Rewards - Avg: {avg_reward:.4f}, Min: {min_reward:.4f}, Max: {max_reward:.4f} | Validity Issues: {num_validity_issues}")
+        std_reward = np.std(reward_stats["total"])
+        print(f"      Rewards - Avg: {avg_reward:.3f} ± {std_reward:.3f}, Range: [{min_reward:.3f}, {max_reward:.3f}]")
     
     return processed_data
 
@@ -540,33 +495,48 @@ async def train_ppo():
     
     print(f"\n{'='*70}")
     print(f"PPO TRAINING: {BASE_MODEL}")
-    print(f"Examples: {len(data)} | Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE} | Samples/Prompt: {NUM_SAMPLES_PER_PROMPT}")
+    print(f"Examples: {len(data)} | Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE}")
+    print(f"Samples/Prompt: {NUM_SAMPLES_PER_PROMPT} | Max Tokens: {MAX_GENERATION_TOKENS}")
+    print(f"Total samples per epoch: {len(data) * NUM_SAMPLES_PER_PROMPT}")
     print(f"{'='*70}\n")
     
     for epoch in range(NUM_PPO_EPOCHS):
+        epoch_start = time.time()
         print(f"\n{'='*70}")
         print(f"EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
         print(f"{'='*70}")
         
         # Stage 1: Save weights and create sampling client
+        t1 = time.time()
         print(f"[1/4] Saving weights...")
         sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
+        print(f"      ⏱️  {time.time() - t1:.1f}s")
         
         # Stage 2: Async sampling
+        t2 = time.time()
         prompts = [ex["full_prompt"] for ex in data]
         print(f"[2/4] Sampling {len(prompts)} prompts × {NUM_SAMPLES_PER_PROMPT} samples = {len(prompts) * NUM_SAMPLES_PER_PROMPT} total...")
         processed_examples = await sample_trajectories_async(sampling_client, tokenizer, prompts, data)
+        print(f"      ⏱️  {time.time() - t2:.1f}s")
         
         # Stage 3: Training step
+        t3 = time.time()
         print(f"[3/4] Running forward/backward and optimizer step...")
-        fwdbwd_coro = training_client.forward_backward_async(processed_examples, "ppo")
-        optim_coro = training_client.optim_step_async(types.AdamParams(learning_rate=LEARNING_RATE))
-        fwdbwd_result, optim_result = await asyncio.gather(fwdbwd_coro, optim_coro)
+        # Submit both requests (first await)
+        fwdbwd_future = await training_client.forward_backward_async(processed_examples, "ppo")
+        optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=LEARNING_RATE))
+        # Wait for results to complete (second await)
+        fwdbwd_result, optim_result = await asyncio.gather(
+            fwdbwd_future.result_async(),
+            optim_future.result_async()
+        )
+        print(f"      ⏱️  {time.time() - t3:.1f}s")
         
         # Stage 4: Log metrics
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
         avg_logprob = np.mean(logprobs)
-        print(f"[4/4] Epoch Complete - Avg LogProb: {avg_logprob:.4f}")
+        epoch_time = time.time() - epoch_start
+        print(f"[4/4] Epoch Complete - Avg LogProb: {avg_logprob:.4f} | Total: {epoch_time:.1f}s")
     
     sampling_client = training_client.save_weights_and_get_sampling_client(name=CHECKPOINT_NAME)
     
