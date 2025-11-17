@@ -100,12 +100,7 @@ Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use 
     }
 
 def load_data(tokenizer=None):
-    print(f"Loading dataset: {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
-    
-    print(f"Dataset loaded. Total examples: {len(dataset)}")
-    print(f"Selecting first {NUM_EXAMPLES} examples\n")
-    
     selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
     return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
 
@@ -470,7 +465,8 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
     # Process all results
     processed_data = []
     reward_stats = {"total": [], "count": 0, "validity_issues": []}
-        
+    
+    for idx, (result, ctx) in enumerate(zip(results, contexts)):
         # Process each sample in the batch
         for seq in result.sequences:
             generated_tokens = seq.tokens
@@ -526,21 +522,8 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         avg_reward = np.mean(reward_stats["total"])
         min_reward = np.min(reward_stats["total"])
         max_reward = np.max(reward_stats["total"])
-        print(f"Reward Stats - Avg: {avg_reward:.4f}, Min: {min_reward:.4f}, Max: {max_reward:.4f}")
-        
-        # Log validity issues
-        if reward_stats["validity_issues"]:
-            print(f"\n{'='*70}")
-            print(f"CODE VALIDITY ISSUES DETECTED: {len(reward_stats['validity_issues'])} samples")
-            print(f"{'='*70}")
-            for i, issue in enumerate(reward_stats["validity_issues"][:3]):
-                print(f"\nIssue {i+1}:")
-                print(f"  Validity Score: {issue['score']:.3f}")
-                print(f"  Penalties: {', '.join(issue['penalties'])}")
-                print(f"  Code Preview: {issue['preview']}")
-            if len(reward_stats["validity_issues"]) > 3:
-                print(f"\n  ... and {len(reward_stats['validity_issues']) - 3} more issues")
-            print(f"{'='*70}\n")
+        num_validity_issues = len(reward_stats["validity_issues"])
+        print(f"Rewards - Avg: {avg_reward:.4f}, Min: {min_reward:.4f}, Max: {max_reward:.4f} | Validity Issues: {num_validity_issues}")
     
     return processed_data
 
@@ -556,47 +539,34 @@ async def train_ppo():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     print(f"\n{'='*70}")
-    print(f"PPO TRAINING CONFIGURATION")
-    print(f"{'='*70}")
-    print(f"Base Model: {BASE_MODEL}")
-    print(f"Learning Rate: {LEARNING_RATE}")
-    print(f"PPO Epochs: {NUM_PPO_EPOCHS}")
-    print(f"Samples per Prompt: {NUM_SAMPLES_PER_PROMPT}")
-    print(f"Clip Epsilon: {PPO_CLIP_EPSILON}")
-    print(f"Total Examples: {len(data)}")
+    print(f"PPO TRAINING: {BASE_MODEL}")
+    print(f"Examples: {len(data)} | Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE} | Samples/Prompt: {NUM_SAMPLES_PER_PROMPT}")
     print(f"{'='*70}\n")
     
     for epoch in range(NUM_PPO_EPOCHS):
         print(f"\n{'='*70}")
-        print(f"PPO EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
+        print(f"EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
         print(f"{'='*70}")
         
+        # Stage 1: Save weights and create sampling client
+        print(f"[1/4] Saving weights...")
         sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
         
+        # Stage 2: Async sampling
         prompts = [ex["full_prompt"] for ex in data]
-        print(f"Launching async sampling for {len(prompts)} prompts with {NUM_SAMPLES_PER_PROMPT} samples each...")
-        
-        # Async sampling with immediate trajectory processing
+        print(f"[2/4] Sampling {len(prompts)} prompts × {NUM_SAMPLES_PER_PROMPT} samples = {len(prompts) * NUM_SAMPLES_PER_PROMPT} total...")
         processed_examples = await sample_trajectories_async(sampling_client, tokenizer, prompts, data)
-        print(f"Processed {len(processed_examples)} trajectories for PPO update")
         
-        # Launch forward/backward and optimizer step asynchronously to overlap computation
-        print(f"Launching async forward/backward pass...")
+        # Stage 3: Training step
+        print(f"[3/4] Running forward/backward and optimizer step...")
         fwdbwd_coro = training_client.forward_backward_async(processed_examples, "ppo")
-        
-        print(f"Launching async optimizer step...")
-        optim_coro = training_client.optim_step_async(
-            types.AdamParams(learning_rate=LEARNING_RATE)
-        )
-        
-        # Wait for both to complete (they overlap internally)
-        print(f"Waiting for forward/backward and optimizer to complete...")
+        optim_coro = training_client.optim_step_async(types.AdamParams(learning_rate=LEARNING_RATE))
         fwdbwd_result, optim_result = await asyncio.gather(fwdbwd_coro, optim_coro)
         
+        # Stage 4: Log metrics
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
         avg_logprob = np.mean(logprobs)
-        
-        print(f"Epoch {epoch + 1} - Avg LogProb: {avg_logprob:.4f}")
+        print(f"[4/4] Epoch Complete - Avg LogProb: {avg_logprob:.4f}")
     
     sampling_client = training_client.save_weights_and_get_sampling_client(name=CHECKPOINT_NAME)
     
@@ -606,7 +576,7 @@ async def train_ppo():
 
 async def evaluate(sampling_client, tokenizer, data):
     print(f"\n{'='*70}")
-    print("EVALUATION")
+    print(f"EVALUATION - {len(data)} examples")
     print(f"{'='*70}")
     results = []
     
@@ -632,9 +602,7 @@ async def evaluate(sampling_client, tokenizer, data):
         })
     
     # Launch ALL evaluation samples concurrently
-    print(f"Launching {len(coroutines)} evaluation samples concurrently...")
     eval_results = await asyncio.gather(*coroutines)
-    print(f"All {len(eval_results)} evaluation samples completed!")
     
     # Process all results
     for eval_result, ctx in zip(eval_results, contexts):
@@ -642,9 +610,6 @@ async def evaluate(sampling_client, tokenizer, data):
         example = ctx["example"]
         expected_response = example["reference_response"]
         user_message = example["user_message"]
-        
-        print(f"\n--- Evaluating Example {idx} ---")
-        print(f"User Request: {user_message[:100]}...")
         
         predicted = tokenizer.decode(eval_result.sequences[0].tokens).strip()
         
@@ -658,23 +623,13 @@ async def evaluate(sampling_client, tokenizer, data):
             "predicted_response": predicted,
             "has_code": has_code
         })
-        
-        print(f"Expected length: {len(expected_response)} chars")
-        print(f"Generated length: {len(predicted)} chars")
-        print(f"Has code structure: {has_code}")
-        print(f"Generated code preview:\n{predicted[:200]}...")
     
     with open(f"{OUTPUT_DIR}/eval_results.jsonl", "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     
     code_rate = sum(r["has_code"] for r in results) / len(results) if results else 0.0
-    print(f"\n{'='*70}")
-    print(f"EVALUATION SUMMARY")
-    print(f"{'='*70}")
-    print(f"Total examples: {len(results)}")
-    print(f"Examples with code structure: {sum(r['has_code'] for r in results)}")
-    print(f"Code generation rate: {code_rate:.2%}")
+    print(f"Evaluation Complete - Code generation rate: {code_rate:.1%} ({sum(r['has_code'] for r in results)}/{len(results)})")
     print(f"Results saved to: {OUTPUT_DIR}/eval_results.jsonl")
     
     return results
