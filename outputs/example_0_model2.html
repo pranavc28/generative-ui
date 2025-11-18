@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Easy Rider Transportation - Model 2</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="container mx-auto p-6">
+        <div class="bg-gray-800 rounded-lg shadow-2xl p-6 mb-4">
+            <h1 class="text-2xl font-bold text-white mb-2">Easy Rider Transportation - Model 2</h1>
+            <p class="text-gray-400 text-sm">Original model output - unmodified React/TypeScript code</p>
+        </div>
+        
+        <div class="bg-gray-800 rounded-lg shadow-2xl overflow-hidden">
+            <div class="bg-gray-700 px-6 py-3 flex justify-between items-center">
+                <span class="text-white font-mono text-sm">App.tsx</span>
+                <button onclick="copyCode()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">
+                    Copy Code
+                </button>
+            </div>
+            <pre class="p-6 overflow-x-auto"><code id="code" class="language-typescript">// src/components/Dashboard.tsx
+import React, { useEffect, useState } from &#x27;react&#x27;;
+import { auth, db } from &#x27;../firebase&#x27;;
+import { collection, query, where, getDocs, updateDoc, doc } from &#x27;firebase/firestore&#x27;;
+import { useNavigate } from &#x27;react-router-dom&#x27;;
+import { User } from &#x27;../types&#x27;;
+
+interface DriverStatus {
+  id: string;
+  name: string;
+  available: boolean;
+  lastOnline: Date;
+}
+
+const Dashboard: React.FC&lt;{ user: User }&gt; = ({ user }) =&gt; {
+  const [drivers, setDrivers] = useState&lt;DriverStatus[]&gt;([]);
+  const [bookings, setBookings] = useState&lt;any[]&gt;([]);
+  const [loading, setLoading] = useState(true);
+  const navigate = useNavigate();
+
+  useEffect(() =&gt; {
+    const fetchDrivers = async () =&gt; {
+      const q = query(collection(db, &#x27;drivers&#x27;));
+      const querySnapshot = await getDocs(q);
+      const driversData = querySnapshot.docs.map(doc =&gt; ({
+        id: doc.id,
+        ...doc.data()
+      })) as DriverStatus[];
+      setDrivers(driversData);
+      setLoading(false);
+    };
+
+    const fetchBookings = async () =&gt; {
+      const q = query(collection(db, &#x27;bookings&#x27;), where(&#x27;status&#x27;, &#x27;==&#x27;, &#x27;pending&#x27;));
+      const querySnapshot = await getDocs(q);
+      const bookingsData = querySnapshot.docs.map(doc =&gt; ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setBookings(bookingsData);
+    };
+
+    fetchDrivers();
+    fetchBookings();
+  }, []);
+
+  const handleDriverStatus = async (driverId: string, available: boolean) =&gt; {
+    await updateDoc(doc(db, &#x27;drivers&#x27;, driverId), { available });
+    setDrivers(drivers.map(d =&gt; 
+      d.id === driverId ? { ...d, available } : d
+    ));
+  };
+
+  const handleAssignRide = async (bookingId: string, driverId: string) =&gt; {
+    if (window.confirm(&#x27;Assign this ride to the driver?&#x27;)) {
+      await updateDoc(doc(db, &#x27;bookings&#x27;, bookingId), { 
+        driverId,
+        status: &#x27;assigned&#x27;
+      });
+      // Update driver status
+      await updateDoc(doc(db, &#x27;drivers&#x27;, driverId), { available: false });
+      // Refresh data
+      window.location.reload();
+    }
+  };
+
+  if (loading) {
+    return (
+      &lt;div className=&quot;min-h-screen bg-gray-50 py-12 px-4 sm:px-6 lg:px-8&quot;&gt;
+        &lt;div className=&quot;max-w-7xl mx-auto&quot;&gt;
+          &lt;div className=&quot;text-center&quot;&gt;
+            &lt;div className=&quot;inline-block h-8 w-8 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent&quot;&gt;&lt;/div&gt;
+            &lt;p className=&quot;mt-4 text-lg text-gray-500&quot;&gt;Loading dashboard data...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+    );
+  }
+
+  return (
+    &lt;div className=&quot;min-h-screen bg-gray-50 py-12 px-4 sm:px-6 lg:px-8&quot;&gt;
+      &lt;div className=&quot;max-w-7xl mx-auto&quot;&gt;
+        &lt;div className=&quot;flex justify-between items-center mb-8&quot;&gt;
+          &lt;h1 className=&quot;text-3xl font-bold text-gray-900&quot;&gt;Owner Dashboard&lt;/h1&gt;
+          &lt;button
+            onClick={() =&gt; auth.signOut()}
+            className=&quot;px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700&quot;
+          &gt;
+            Logout
+          &lt;/button&gt;
+        &lt;/div&gt;
+
+        &lt;div className=&quot;grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8&quot;&gt;
+          &lt;div className=&quot;lg:col-span-1&quot;&gt;
+            &lt;div className=&quot;bg-white shadow rounded-lg p-6&quot;&gt;
+              &lt;h2 className=&quot;text-xl font-semibold text-gray-900 mb-4&quot;&gt;Driver Status&lt;/h2&gt;
+              &lt;div className=&quot;space-y-4&quot;&gt;
+                {drivers.map(driver =&gt; (
+                  &lt;div key={driver.id} className=&quot;flex items-center justify-between p-3 border rounded&quot;&gt;
+                    &lt;div&gt;
+                      &lt;p className=&quot;font-medium&quot;&gt;{driver.name}&lt;/p&gt;
+                      &lt;p className=&quot;text-sm text-gray-500&quot;&gt;
+                        {driver.available ? &#x27;Available&#x27; : &#x27;Busy&#x27;}
+                      &lt;/p&gt;
+                    &lt;/div&gt;
+                    &lt;button
+                      onClick={() =&gt; handleDriverStatus(driver.id, !driver.available)}
+                      className={`px-3 py-1 rounded text-sm ${
+                        driver.available 
+                          ? &#x27;bg-green-100 text-green-800&#x27; 
+                          : &#x27;bg-red-100 text-red-800&#x27;
+                      }`}
+                    &gt;
+                      {driver.available ? &#x27;Mark Busy&#x27; : &#x27;Mark Available&#x27;}
+                    &lt;/button&gt;
+                  &lt;/div&gt;
+                ))}
+              &lt;/div&gt;
+            &lt;/div&gt;
+          &lt;/div&gt;
+
+          &lt;div className=&quot;lg:col-span-2&quot;&gt;
+            &lt;div className=&quot;bg-white shadow rounded-lg p-6&quot;&gt;
+              &lt;h2 className=&quot;text-xl font-semibold text-gray-900 mb-4&quot;&gt;Pending Rides&lt;/h2&gt;
+              {bookings.length === 0 ? (
+                &lt;p className=&quot;text-gray-500&quot;&gt;No pending rides at the moment.&lt;/p&gt;
+              ) : (
+                &lt;div className=&quot;overflow-x-auto&quot;&gt;
+                  &lt;table className=&quot;min-w-full divide-y divide-gray-200&quot;&gt;
+                    &lt;thead className=&quot;bg-gray-50&quot;&gt;
+                      &lt;tr&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Booking ID&lt;/th&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Pickup&lt;/th&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Dropoff&lt;/th&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Passengers&lt;/th&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Status&lt;/th&gt;
+                        &lt;th className=&quot;px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider&quot;&gt;Actions&lt;/th&gt;
+                      &lt;/tr&gt;
+                    &lt;/thead&gt;
+                    &lt;tbody className=&quot;bg-white divide-y divide-gray-200&quot;&gt;
+                      {bookings.map(booking =&gt; (
+                        &lt;tr key={booking.id}&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap text-sm text-gray-500&quot;&gt;{booking.id}&lt;/td&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap text-sm text-gray-900&quot;&gt;{booking.pickup}&lt;/td&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap text-sm text-gray-900&quot;&gt;{booking.dropoff}&lt;/td&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap text-sm text-gray-900&quot;&gt;{booking.passengers}&lt;/td&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap&quot;&gt;
+                            &lt;span className=&quot;px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800&quot;&gt;
+                              Pending
+                            &lt;/span&gt;
+                          &lt;/td&gt;
+                          &lt;td className=&quot;px-6 py-4 whitespace-nowrap text-sm&quot;&gt;
+                            &lt;button
+                              onClick={() =&gt; handleAssignRide(booking.id, drivers[0].id)}
+                              className=&quot;text-indigo-600 hover:text-indigo-900&quot;
+                            &gt;
+                              Assign to {drivers[0].name}
+                            &lt;/button&gt;
+                          &lt;/td&gt;
+                        &lt;/tr&gt;
+                      ))}
+                    &lt;/tbody&gt;
+                  &lt;/table&gt;
+                &lt;/div&gt;
+              )}
+            &lt;/div&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;div className=&quot;bg-white shadow rounded-lg p-6&quot;&gt;
+          &lt;h2 className=&quot;text-xl font-semibold text-gray-900 mb-4&quot;&gt;Recent Activity&lt;/h2&gt;
+          &lt;div className=&quot;space-y-4&quot;&gt;
+            &lt;div className=&quot;flex items-center&quot;&gt;
+              &lt;div className=&quot;flex-shrink-0 h-10 w-10 bg-indigo-100 rounded-full flex items-center justify-center&quot;&gt;
+                &lt;svg className=&quot;h-6 w-6 text-indigo-600&quot; fill=&quot;none&quot; viewBox=&quot;0 0 24 24&quot; stroke=&quot;currentColor&quot;&gt;
+                  &lt;path strokeLinecap=&quot;round&quot; strokeLinejoin=&quot;round&quot; strokeWidth={2} d=&quot;M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z&quot; /&gt;
+                &lt;/svg&gt;
+              &lt;/div&gt;
+              &lt;div className=&quot;ml-4&quot;&gt;
+                &lt;p className=&quot;text-sm font-medium text-gray-900&quot;&gt;New ride request received&lt;/p&gt;
+                &lt;p className=&quot;text-sm text-gray-500&quot;&gt;2 minutes ago&lt;/p&gt;
+              &lt;/div&gt;
+            &lt;/div&gt;
+            &lt;div className=&quot;flex items-center&quot;&gt;
+              &lt;div className=&quot;flex-shrink-0 h-10 w-10 bg-green-100 rounded-full flex items-center justify-center&quot;&gt;
+                &lt;svg className=&quot;h-6 w-6 text-green-600&quot; fill=&quot;none&quot; viewBox=&quot;0 0 24 24&quot; stroke=&quot;currentColor&quot;&gt;
+                  &lt;path strokeLinecap=&quot;round&quot; strokeLinejoin=&quot;round&quot; strokeWidth={2} d=&quot;M5 13l4 4L19 7&quot; /&gt;
+                &lt;/svg&gt;
+              &lt;/div&gt;
+              &lt;div className=&quot;ml-4&quot;&gt;
+                &lt;p className=&quot;text-sm font-medium text-gray-900&quot;&gt;Driver John Doe marked as available&lt;/p&gt;
+                &lt;p className=&quot;text-sm text-gray-500&quot;&gt;15 minutes ago&lt;/p&gt;
+              &lt;/div&gt;
+            &lt;/div&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+};
+
+export default Dashboard;
+</code></pre>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-tsx.min.js"></script>
+    <script>
+        function copyCode() {
+            const code = document.getElementById('code').textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                alert('Code copied to clipboard!');
+            });
+        }
+        Prism.highlightAll();
+    </script>
+</body>
+</html>

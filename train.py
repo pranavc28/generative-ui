@@ -27,11 +27,12 @@ from sklearn.feature_extraction.text import CountVectorizer
 DATASET_NAME = "cfahlgren1/react-code-instructions"
 NUM_EXAMPLES = 600  # INCREASED: 20 was too small, need more diverse training data
 NUM_EVAL_EXAMPLES = 10  # Evaluate on subset for faster feedback (600 would take too long)
+MAX_PROMPT_TOKENS = 16000  # Filter: Keep prompts under 16k tokens (leave 16k for generation)
 BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
 NUM_PPO_EPOCHS = 5  # INCREASED: More epochs for better convergence
 NUM_SAMPLES_PER_PROMPT = 4  # INCREASED: More samples for better exploration and policy gradients
-MAX_GENERATION_TOKENS = 20480  # INCREASED: 12k still caused 20% truncation, now ~67% higher
+MAX_GENERATION_TOKENS = 16000  # Reduced from 20k: Model has 32k context, need room for long prompts
 GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
 PPO_CLIP_EPSILON = 0.2
 VALUE_CLIP_EPSILON = 0.2
@@ -114,8 +115,32 @@ Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use 
 
 def load_data(tokenizer=None):
     dataset = load_dataset(DATASET_NAME, split="train")
-    selected = dataset.select(range(min(NUM_EXAMPLES, len(dataset))))
-    return [format_react_example(ex, i, tokenizer) for i, ex in enumerate(selected)]
+    
+    # Format all examples first
+    formatted_examples = []
+    skipped = 0
+    
+    for i, ex in enumerate(dataset):
+        formatted = format_react_example(ex, i, tokenizer)
+        
+        # Filter: Skip examples with prompts that are too long
+        if tokenizer:
+            prompt_length = len(tokenizer.encode(formatted["full_prompt"]))
+            
+            # Check if prompt + max_tokens would exceed model context
+            if prompt_length > MAX_PROMPT_TOKENS:
+                skipped += 1
+                continue
+        
+        formatted_examples.append(formatted)
+        
+        # Stop once we have enough examples
+        if len(formatted_examples) >= NUM_EXAMPLES:
+            break
+    
+    print(f"Loaded {len(formatted_examples)} examples (skipped {skipped} with prompts > {MAX_PROMPT_TOKENS} tokens)")
+    
+    return formatted_examples
 
 def extract_valid_identifiers_from_reference(reference_code):
     """
@@ -436,9 +461,18 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
     # Prepare all sampling requests with context
     contexts = []
     coroutines = []
+    prompt_lengths = []
     
     for prompt_text in prompts:
         prompt_tokens = tokenizer.encode(prompt_text)
+        prompt_len = len(prompt_tokens)
+        prompt_lengths.append(prompt_len)
+        
+        # Safety check: Ensure prompt + max_tokens doesn't exceed context window
+        if prompt_len + MAX_GENERATION_TOKENS > 32768:
+            print(f"WARNING: Skipping prompt with {prompt_len} tokens (would exceed context window)")
+            continue
+        
         prompt_input = types.ModelInput.from_ints(prompt_tokens)
         
         # Find reference response for reward computation
@@ -461,6 +495,10 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             "prompt_text": prompt_text,
             "ref_response": ref_response
         })
+    
+    # Log prompt length statistics
+    if prompt_lengths:
+        print(f"      Prompt lengths - Min: {min(prompt_lengths)}, Max: {max(prompt_lengths)}, Avg: {sum(prompt_lengths)/len(prompt_lengths):.0f}")
     
     # Launch ALL sampling requests concurrently using asyncio.gather
     print(f"      🚀 Launching {len(coroutines)} concurrent sampling requests...")

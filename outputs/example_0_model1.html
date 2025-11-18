@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Easy Rider Transportation - Model 1</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="container mx-auto p-6">
+        <div class="bg-gray-800 rounded-lg shadow-2xl p-6 mb-4">
+            <h1 class="text-2xl font-bold text-white mb-2">Easy Rider Transportation - Model 1</h1>
+            <p class="text-gray-400 text-sm">Original model output - unmodified React/TypeScript code</p>
+        </div>
+        
+        <div class="bg-gray-800 rounded-lg shadow-2xl overflow-hidden">
+            <div class="bg-gray-700 px-6 py-3 flex justify-between items-center">
+                <span class="text-white font-mono text-sm">App.tsx</span>
+                <button onclick="copyCode()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">
+                    Copy Code
+                </button>
+            </div>
+            <pre class="p-6 overflow-x-auto"><code id="code" class="language-typescript">import React, { useState, useEffect, useMemo, memo, createContext, useContext, useCallback } from &#x27;react&#x27;;
+import ReactDOM from &#x27;react-dom&#x27;;
+
+interface Booking {
+  id: string;
+  pickupLocation: string;
+  dropoffLocation: string;
+  pickupTime: Date;
+  customerName: string;
+  customerPhone: string;
+  status: &#x27;pending&#x27; | &#x27;assigned&#x27; | &#x27;completed&#x27;;
+  driverId?: string;
+}
+
+interface Driver {
+  id: string;
+  name: string;
+  isOnline: boolean;
+}
+
+interface AppState {
+  bookings: Booking[];
+  drivers: Driver[];
+  selectedBookingId: string | null;
+  selectedDriverId: string | null;
+}
+
+const initialState: AppState = {
+  bookings: [],
+  drivers: [
+    { id: &#x27;1&#x27;, name: &#x27;John Doe&#x27;, isOnline: false },
+    { id: &#x27;2&#x27;, name: &#x27;Jane Smith&#x27;, isOnline: false },
+  ],
+  selectedBookingId: null,
+  selectedDriverId: null,
+};
+
+const AppContext = createContext&lt;{ state: AppState; dispatch: React.Dispatch&lt;Action&gt; }&gt;({
+  state: initialState,
+  dispatch: () =&gt; {},
+});
+
+type Action =
+  | { type: &#x27;ADD_BOOKING&#x27;; payload: Booking }
+  | { type: &#x27;ASSIGN_DRIVER&#x27;; payload: { bookingId: string; driverId: string } }
+  | { type: &#x27;TOGGLE_DRIVER_STATUS&#x27;; payload: string }
+  | { type: &#x27;SELECT_BOOKING&#x27;; payload: string | null }
+  | { type: &#x27;SELECT_DRIVER&#x27;; payload: string | null };
+
+const appReducer = (state: AppState, action: Action): AppState =&gt; {
+  switch (action.type) {
+    case &#x27;ADD_BOOKING&#x27;:
+      return { ...state, bookings: [...state.bookings, action.payload] };
+    case &#x27;ASSIGN_DRIVER&#x27;:
+      const updatedBookings = state.bookings.map((booking) =&gt;
+        booking.id === action.payload.bookingId
+          ? { ...booking, status: &#x27;assigned&#x27;, driverId: action.payload.driverId }
+          : booking
+      );
+      return { ...state, bookings: updatedBookings };
+    case &#x27;TOGGLE_DRIVER_STATUS&#x27;:
+      const updatedDrivers = state.drivers.map((driver) =&gt;
+        driver.id === action.payload ? { ...driver, isOnline: !driver.isOnline } : driver
+      );
+      return { ...state, drivers: updatedDrivers };
+    case &#x27;SELECT_BOOKING&#x27;:
+      return { ...state, selectedBookingId: action.payload };
+    case &#x27;SELECT_DRIVER&#x27;:
+      return { ...state, selectedDriverId: action.payload };
+    default:
+      return state;
+  }
+};
+
+const AppProvider: React.FC&lt;{ children: React.ReactNode }&gt; = ({ children }) =&gt; {
+  const [state, dispatch] = React.useReducer(appReducer, initialState);
+
+  return (
+    &lt;AppContext.Provider value={{ state, dispatch }}&gt;
+      {children}
+    &lt;/AppContext.Provider&gt;
+  );
+};
+
+const useAppContext = () =&gt; useContext(AppContext);
+
+const BookingForm = memo(() =&gt; {
+  const { dispatch } = useAppContext();
+  const [pickupLocation, setPickupLocation] = useState(&#x27;&#x27;);
+  const [dropoffLocation, setDropoffLocation] = useState(&#x27;&#x27;);
+  const [pickupTime, setPickupTime] = useState(&#x27;&#x27;);
+  const [customerName, setCustomerName] = useState(&#x27;&#x27;);
+  const [customerPhone, setCustomerPhone] = useState(&#x27;&#x27;);
+
+  const handleSubmit = useCallback(
+    (e: React.FormEvent) =&gt; {
+      e.preventDefault();
+      const newBooking: Booking = {
+        id: Date.now().toString(),
+        pickupLocation,
+        dropoffLocation,
+        pickupTime: new Date(pickupTime),
+        customerName,
+        customerPhone,
+        status: &#x27;pending&#x27;,
+      };
+      dispatch({ type: &#x27;ADD_BOOKING&#x27;, payload: newBooking });
+      setPickupLocation(&#x27;&#x27;);
+      setDropoffLocation(&#x27;&#x27;);
+      setPickupTime(&#x27;&#x27;);
+      setCustomerName(&#x27;&#x27;);
+      setCustomerPhone(&#x27;&#x27;);
+    },
+    [dispatch, pickupLocation, dropoffLocation, pickupTime, customerName, customerPhone]
+  );
+
+  return (
+    &lt;form onSubmit={handleSubmit} className=&quot;bg-white p-6 rounded-lg shadow-md max-w-md mx-auto&quot;&gt;
+      &lt;h2 className=&quot;text-2xl font-bold mb-4&quot;&gt;Book a Ride&lt;/h2&gt;
+      &lt;div className=&quot;mb-4&quot;&gt;
+        &lt;label htmlFor=&quot;pickupLocation&quot; className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+          Pickup Location
+        &lt;/label&gt;
+        &lt;input
+          type=&quot;text&quot;
+          id=&quot;pickupLocation&quot;
+          value={pickupLocation}
+          onChange={(e) =&gt; setPickupLocation(e.target.value)}
+          required
+          className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+        /&gt;
+      &lt;/div&gt;
+      &lt;div className=&quot;mb-4&quot;&gt;
+        &lt;label htmlFor=&quot;dropoffLocation&quot; className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+          Dropoff Location
+        &lt;/label&gt;
+        &lt;input
+          type=&quot;text&quot;
+          id=&quot;dropoffLocation&quot;
+          value={dropoffLocation}
+          onChange={(e) =&gt; setDropoffLocation(e.target.value)}
+          required
+          className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+        /&gt;
+      &lt;/div&gt;
+      &lt;div className=&quot;mb-4&quot;&gt;
+        &lt;label htmlFor=&quot;pickupTime&quot; className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+          Pickup Time
+        &lt;/label&gt;
+        &lt;input
+          type=&quot;datetime-local&quot;
+          id=&quot;pickupTime&quot;
+          value={pickupTime}
+          onChange={(e) =&gt; setPickupTime(e.target.value)}
+          required
+          className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+        /&gt;
+      &lt;/div&gt;
+      &lt;div className=&quot;mb-4&quot;&gt;
+        &lt;label htmlFor=&quot;customerName&quot; className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+          Customer Name
+        &lt;/label&gt;
+        &lt;input
+          type=&quot;text&quot;
+          id=&quot;customerName&quot;
+          value={customerName}
+          onChange={(e) =&gt; setCustomerName(e.target.value)}
+          required
+          className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+        /&gt;
+      &lt;/div&gt;
+      &lt;div className=&quot;mb-4&quot;&gt;
+        &lt;label htmlFor=&quot;customerPhone&quot; className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+          Customer Phone
+        &lt;/label&gt;
+        &lt;input
+          type=&quot;tel&quot;
+          id=&quot;customerPhone&quot;
+          value={customerPhone}
+          onChange={(e) =&gt; setCustomerPhone(e.target.value)}
+          required
+          className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+        /&gt;
+      &lt;/div&gt;
+      &lt;button
+        type=&quot;submit&quot;
+        className=&quot;bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline&quot;
+      &gt;
+        Book Ride
+      &lt;/button&gt;
+    &lt;/form&gt;
+  );
+});
+
+const BookingCard = memo(({ booking }: { booking: Booking }) =&gt; {
+  const { state, dispatch } = useAppContext();
+
+  const availableDrivers = useMemo(() =&gt; state.drivers.filter((driver) =&gt; driver.isOnline), [state.drivers]);
+  const [selectedDriver, setSelectedDriver] = useState&lt;string | null&gt;(null);
+
+  const handleAssignDriver = useCallback(() =&gt; {
+    if (selectedDriver) {
+      dispatch({ type: &#x27;ASSIGN_DRIVER&#x27;, payload: { bookingId: booking.id, driverId: selectedDriver } });
+      setSelectedDriver(null);
+    }
+  }, [dispatch, booking.id, selectedDriver]);
+
+  return (
+    &lt;div className=&quot;bg-white p-6 rounded-lg shadow-md mb-4&quot;&gt;
+      &lt;h3 className=&quot;text-xl font-bold mb-2&quot;&gt;Booking #{booking.id}&lt;/h3&gt;
+      &lt;p&gt;&lt;strong&gt;Pickup Location:&lt;/strong&gt; {booking.pickupLocation}&lt;/p&gt;
+      &lt;p&gt;&lt;strong&gt;Dropoff Location:&lt;/strong&gt; {booking.dropoffLocation}&lt;/p&gt;
+      &lt;p&gt;&lt;strong&gt;Pickup Time:&lt;/strong&gt; {new Date(booking.pickupTime).toLocaleString()}&lt;/p&gt;
+      &lt;p&gt;&lt;strong&gt;Customer Name:&lt;/strong&gt; {booking.customerName}&lt;/p&gt;
+      &lt;p&gt;&lt;strong&gt;Customer Phone:&lt;/strong&gt; {booking.customerPhone}&lt;/p&gt;
+      &lt;p&gt;&lt;strong&gt;Status:&lt;/strong&gt; {booking.status}&lt;/p&gt;
+      {booking.status === &#x27;pending&#x27; &amp;&amp; (
+        &lt;div className=&quot;mt-4&quot;&gt;
+          &lt;label htmlFor={`driver-${booking.id}`} className=&quot;block text-gray-700 font-bold mb-2&quot;&gt;
+            Assign Driver
+          &lt;/label&gt;
+          &lt;select
+            id={`driver-${booking.id}`}
+            value={selectedDriver || &#x27;&#x27;}
+            onChange={(e) =&gt; setSelectedDriver(e.target.value)}
+            className=&quot;shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline&quot;
+          &gt;
+            &lt;option value=&quot;&quot;&gt;Select a driver&lt;/option&gt;
+            {availableDrivers.map((driver) =&gt; (
+              &lt;option key={driver.id} value={driver.id}&gt;
+                {driver.name}
+              &lt;/option&gt;
+            ))}
+          &lt;/select&gt;
+          &lt;button
+            onClick={handleAssignDriver}
+            className=&quot;mt-2 bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline&quot;
+            disabled={!selectedDriver}
+          &gt;
+            Assign
+          &lt;/button&gt;
+        &lt;/div&gt;
+      )}
+    &lt;/div&gt;
+  );
+});
+
+const BookingList = memo(() =&gt; {
+  const { state } = useAppContext();
+
+  return (
+    &lt;div className=&quot;grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4&quot;&gt;
+      {state.bookings.map((booking) =&gt; (
+        &lt;BookingCard key={booking.id} booking={booking} /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+});
+
+const DriverCard = memo(({ driver }: { driver: Driver }) =&gt; {
+  const { dispatch } = useAppContext();
+
+  const toggleDriverStatus = useCallback(() =&gt; {
+    dispatch({ type: &#x27;TOGGLE_DRIVER_STATUS&#x27;, payload: driver.id });
+  }, [dispatch, driver.id]);
+
+  return (
+    &lt;div className=&quot;bg-white p-6 rounded-lg shadow-md mb-4&quot;&gt;
+      &lt;h3 className=&quot;text-xl font-bold mb-2&quot;&gt;{driver.name}&lt;/h3&gt;
+      &lt;p&gt;&lt;strong&gt;Status:&lt;/strong&gt; {driver.isOnline ? &#x27;Online&#x27; : &#x27;Offline&#x27;}&lt;/p&gt;
+      &lt;button
+        onClick={toggleDriverStatus}
+        className={`mt-2 ${driver.isOnline ? &#x27;bg-red-500 hover:bg-red-700&#x27; : &#x27;bg-green-500 hover:bg-green-700&#x27;} text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline`}
+      &gt;
+        {driver.isOnline ? &#x27;Go Offline&#x27; : &#x27;Go Online&#x27;}
+      &lt;/button&gt;
+    &lt;/div&gt;
+  );
+});
+
+const DriverList = memo(() =&gt; {
+  const { state } = useAppContext();
+
+  return (
+    &lt;div className=&quot;grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4&quot;&gt;
+      {state.drivers.map((driver) =&gt; (
+        &lt;DriverCard key={driver.id} driver={driver} /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+});
+
+const Navbar = memo(() =&gt; {
+  return (
+    &lt;nav className=&quot;bg-blue-500 p-4&quot;&gt;
+      &lt;div className=&quot;container mx-auto flex justify-between items-center&quot;&gt;
+        &lt;div className=&quot;text-white text-2xl font-bold&quot;&gt;
+          Easy Rider Transportation
+        &lt;/div&gt;
+        &lt;div className=&quot;flex space-x-4&quot;&gt;
+          &lt;button className=&quot;text-white hover:text-gray-200&quot;&gt;Bookings&lt;/button&gt;
+          &lt;button className=&quot;text-white hover:text-gray-200&quot;&gt;Drivers&lt;/button&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+    &lt;/nav&gt;
+  );
+});
+
+const Footer = memo(() =&gt; {
+  return (
+    &lt;footer className=&quot;bg-gray-800 text-white text-center p-4 mt-8&quot;&gt;
+      &amp;copy; 2023 Easy Rider Transportation. All rights reserved.
+    &lt;/footer&gt;
+  );
+});
+
+const App: React.FC = () =&gt; {
+  const { state } = useAppContext();
+
+  return (
+    &lt;AppProvider&gt;
+      &lt;div className=&quot;min-h-screen flex flex-col justify-between bg-gray-100&quot;&gt;
+        &lt;Navbar /&gt;
+        &lt;main className=&quot;container mx-auto p-4 flex-1&quot;&gt;
+          &lt;div className=&quot;p-4&quot;&gt;
+            &lt;BookingForm /&gt;
+          &lt;/div&gt;
+          &lt;div className=&quot;p-4&quot;&gt;
+            &lt;h2 className=&quot;text-2xl font-bold mb-4&quot;&gt;Bookings&lt;/h2&gt;
+            &lt;BookingList /&gt;
+          &lt;/div&gt;
+          &lt;div className=&quot;p-4&quot;&gt;
+            &lt;h2 className=&quot;text-2xl font-bold mb-4&quot;&gt;Drivers&lt;/h2&gt;
+            &lt;DriverList /&gt;
+          &lt;/div&gt;
+        &lt;/main&gt;
+        &lt;Footer /&gt;
+      &lt;/div&gt;
+    &lt;/AppProvider&gt;
+  );
+};
+
+export default App;
+</code></pre>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-tsx.min.js"></script>
+    <script>
+        function copyCode() {
+            const code = document.getElementById('code').textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                alert('Code copied to clipboard!');
+            });
+        }
+        Prism.highlightAll();
+    </script>
+</body>
+</html>

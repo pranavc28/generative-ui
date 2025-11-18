@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Homepage - Model 1</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900">
+    <div class="container mx-auto p-6">
+        <div class="bg-gray-800 rounded-lg shadow-2xl p-6 mb-4">
+            <h1 class="text-2xl font-bold text-white mb-2">Google Homepage - Model 1</h1>
+            <p class="text-gray-400 text-sm">Original model output - unmodified React/TypeScript code</p>
+        </div>
+        
+        <div class="bg-gray-800 rounded-lg shadow-2xl overflow-hidden">
+            <div class="bg-gray-700 px-6 py-3 flex justify-between items-center">
+                <span class="text-white font-mono text-sm">App.tsx</span>
+                <button onclick="copyCode()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">
+                    Copy Code
+                </button>
+            </div>
+            <pre class="p-6 overflow-x-auto"><code id="code" class="language-typescript">import React, { useState } from &#x27;react&#x27;;
+
+const App: React.FC = () =&gt; {
+  const [query, setQuery] = useState&lt;string&gt;(&#x27;&#x27;);
+  const [searchResults, setSearchResults] = useState&lt;string[]&gt;([]);
+  const [isDarkMode, setIsDarkMode] = useState&lt;boolean&gt;(false);
+
+  const handleSearch = (e: React.FormEvent) =&gt; {
+    e.preventDefault();
+    // Mock search results
+    setSearchResults([&#x27;Result 1 for &#x27; + query, &#x27;Result 2 for &#x27; + query, &#x27;Result 3 for &#x27; + query]);
+  };
+
+  const toggleDarkMode = () =&gt; {
+    setIsDarkMode(!isDarkMode);
+  };
+
+  return (
+    &lt;div className={`${isDarkMode ? &#x27;bg-gray-900 text-white&#x27; : &#x27;bg-white text-gray-900&#x27;} min-h-screen flex flex-col items-center justify-center p-4 transition-colors duration-300`}&gt;
+      &lt;header className=&quot;w-full max-w-2xl mb-8 flex justify-between items-center&quot;&gt;
+        &lt;div className=&quot;flex items-center space-x-2&quot;&gt;
+          &lt;svg width=&quot;32&quot; height=&quot;32&quot; viewBox=&quot;0 0 32 32&quot; fill=&quot;none&quot; xmlns=&quot;http://www.w3.org/2000/svg&quot;&gt;
+            &lt;circle cx=&quot;16&quot; cy=&quot;16&quot; r=&quot;14&quot; stroke=&quot;currentColor&quot; strokeWidth=&quot;2&quot; fill=&quot;none&quot; /&gt;
+            &lt;path d=&quot;M20.5 20.5L26 26&quot; stroke=&quot;currentColor&quot; strokeWidth=&quot;2&quot; strokeLinecap=&quot;round&quot; /&gt;
+          &lt;/svg&gt;
+          &lt;span className=&quot;font-bold text-2xl&quot;&gt;Google&lt;/span&gt;
+        &lt;/div&gt;
+        &lt;button onClick={toggleDarkMode} className=&quot;p-2 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors duration-300&quot;&gt;
+          &lt;svg width=&quot;24&quot; height=&quot;24&quot; viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; xmlns=&quot;http://www.w3.org/2000/svg&quot;&gt;
+            &lt;circle cx=&quot;12&quot; cy=&quot;12&quot; r=&quot;6&quot; stroke=&quot;currentColor&quot; strokeWidth=&quot;2&quot; fill=&quot;none&quot; /&gt;
+          &lt;/svg&gt;
+        &lt;/button&gt;
+      &lt;/header&gt;
+      &lt;form onSubmit={handleSearch} className=&quot;w-full max-w-xl mb-8&quot;&gt;
+        &lt;div className=&quot;relative&quot;&gt;
+          &lt;input
+            type=&quot;text&quot;
+            value={query}
+            onChange={(e) =&gt; setQuery(e.target.value)}
+            placeholder=&quot;Search Google or type a URL&quot;
+            className=&quot;w-full p-4 pr-12 rounded-lg border-2 border-gray-300 dark:border-gray-700 focus:outline-none focus:border-blue-500 dark:focus:border-blue-500&quot;
+          /&gt;
+          &lt;button type=&quot;submit&quot; className=&quot;absolute inset-y-0 right-0 pr-4 flex items-center&quot;&gt;
+            &lt;svg width=&quot;24&quot; height=&quot;24&quot; viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; xmlns=&quot;http://www.w3.org/2000/svg&quot;&gt;
+              &lt;circle cx=&quot;11&quot; cy=&quot;11&quot; r=&quot;8&quot; stroke=&quot;currentColor&quot; strokeWidth=&quot;2&quot; fill=&quot;none&quot; /&gt;
+              &lt;line x1=&quot;21&quot; y1=&quot;21&quot; x2=&quot;16.65&quot; y2=&quot;16.65&quot; stroke=&quot;currentColor&quot; strokeWidth=&quot;2&quot; /&gt;
+            &lt;/svg&gt;
+          &lt;/button&gt;
+        &lt;/div&gt;
+      &lt;/form&gt;
+      &lt;div className=&quot;w-full max-w-3xl&quot;&gt;
+        {searchResults.length &gt; 0 ? (
+          &lt;div className=&quot;space-y-4&quot;&gt;
+            {searchResults.map((result, index) =&gt; (
+              &lt;div key={index} className=&quot;p-4 bg-gray-100 dark:bg-gray-800 rounded-lg shadow-md&quot;&gt;
+                &lt;a href=&quot;#&quot; className=&quot;text-blue-500 hover:underline dark:text-blue-400&quot;&gt;
+                  {result}
+                &lt;/a&gt;
+                &lt;p className=&quot;text-sm text-gray-700 dark:text-gray-400&quot;&gt;https://www.example.com/{result}&lt;/p&gt;
+              &lt;/div&gt;
+            ))}
+          &lt;/div&gt;
+        ) : (
+          &lt;div className=&quot;text-center&quot;&gt;
+            &lt;img src=&quot;https://placehold.co/600x400&quot; alt=&quot;Placeholder&quot; className=&quot;rounded-lg shadow-md&quot; /&gt;
+          &lt;/div&gt;
+        )}
+      &lt;/div&gt;
+      &lt;footer className=&quot;w-full max-w-2xl mt-8 flex justify-between items-center&quot;&gt;
+        &lt;div className=&quot;flex items-center space-x-4&quot;&gt;
+          &lt;span&gt;United States&lt;/span&gt;
+        &lt;/div&gt;
+        &lt;div className=&quot;flex items-center space-x-4&quot;&gt;
+          &lt;a href=&quot;#&quot; className=&quot;text-gray-600 dark:text-gray-400 hover:underline&quot;&gt;Help&lt;/a&gt;
+          &lt;a href=&quot;#&quot; className=&quot;text-gray-600 dark:text-gray-400 hover:underline&quot;&gt;Privacy&lt;/a&gt;
+          &lt;a href=&quot;#&quot; className=&quot;text-gray-600 dark:text-gray-400 hover:underline&quot;&gt;Terms&lt;/a&gt;
+        &lt;/div&gt;
+      &lt;/footer&gt;
+    &lt;/div&gt;
+  );
+};
+
+export default App;
+</code></pre>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-tsx.min.js"></script>
+    <script>
+        function copyCode() {
+            const code = document.getElementById('code').textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                alert('Code copied to clipboard!');
+            });
+        }
+        Prism.highlightAll();
+    </script>
+</body>
+</html>
