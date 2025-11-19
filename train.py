@@ -39,26 +39,14 @@ VALUE_CLIP_EPSILON = 0.2
 GAE_LAMBDA = 0.95
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v5"  # v5: 3x data, 2x samples, stronger rewards, quote validation
+CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v6"
 
-# Simplified Reward System - Focus on Core Quality
-# 
-# Philosophy: Keep it simple! PPO learns best with clear, strong signals.
-# Start with fundamentals, add complexity later if needed.
-#
-# Phase 2: Improve code quality after C-grade results (60% valid)
-REWARD_BASE = 1.0                      # Base reward
-REWARD_COMPLETENESS_WEIGHT = 15.0      # CRITICAL: Code must be complete (not truncated) - INCREASED 50%!
-REWARD_VALIDITY_WEIGHT = 6.0           # IMPORTANT: Basic syntax validity (balanced braces) - INCREASED 50%!
-REWARD_QUOTE_WEIGHT = 4.0              # NEW: Balanced quotes (30% of errors were quote issues)
-REWARD_LENGTH_PENALTY_WEIGHT = 0.1     # MINOR: Encourage reasonable length
-#
-# Eval v4 results (C grade): 60% valid, 40% invalid
-# Issues: 20% truncation, 30% quote mismatches, 20% structural errors
-# → Further increased weights and added quote-specific reward
-#
-# Removed (for now): TailwindCSS similarity, JSX structure analysis, 
-# undefined variable detection. Add these back in Phase 3 if needed.
+REWARD_BASE = 1.0
+REWARD_COMPLETENESS_WEIGHT = 15.0
+REWARD_VALIDITY_WEIGHT = 6.0
+REWARD_QUOTE_WEIGHT = 4.0
+REWARD_DYNAMIC_REACT_WEIGHT = 5.0
+REWARD_LENGTH_PENALTY_WEIGHT = 0.1
 
 def format_react_example(example, idx, tokenizer=None):
     messages = example.get('messages', [])
@@ -67,7 +55,6 @@ def format_react_example(example, idx, tokenizer=None):
     user_message = messages[1]['content'] if len(messages) > 1 else ''
     assistant_response = messages[2]['content'] if len(messages) > 2 else ''
     
-    # Add critical code correctness instructions to the system prompt
     code_correctness_instructions = """
 
 CRITICAL CODE QUALITY REQUIREMENTS:
@@ -115,49 +102,34 @@ Generate COMPLETE, SYNTACTICALLY CORRECT, and FULLY FUNCTIONAL code. Do not use 
 
 def load_data(tokenizer=None):
     dataset = load_dataset(DATASET_NAME, split="train")
-    
-    # Format all examples first
     formatted_examples = []
     skipped = 0
     
     for i, ex in enumerate(dataset):
         formatted = format_react_example(ex, i, tokenizer)
         
-        # Filter: Skip examples with prompts that are too long
         if tokenizer:
             prompt_length = len(tokenizer.encode(formatted["full_prompt"]))
-            
-            # Check if prompt + max_tokens would exceed model context
             if prompt_length > MAX_PROMPT_TOKENS:
                 skipped += 1
                 continue
         
         formatted_examples.append(formatted)
-        
-        # Stop once we have enough examples
         if len(formatted_examples) >= NUM_EXAMPLES:
             break
     
     print(f"Loaded {len(formatted_examples)} examples (skipped {skipped} with prompts > {MAX_PROMPT_TOKENS} tokens)")
-    
     return formatted_examples
 
 def extract_valid_identifiers_from_reference(reference_code):
-    """
-    Extract valid identifiers (imports, constants) from reference code.
-    This helps avoid penalizing the generated code for using identifiers 
-    that are imported/defined in the reference.
-    """
     valid_ids = set()
     
     try:
-        # Extract all imports (named and default)
-        # Match: import X from 'Y' or import { A, B } from 'Y' or import * as X from 'Y'
         import_patterns = [
-            r'import\s+(\w+)\s+from',  # default imports
-            r'import\s+\*\s+as\s+(\w+)\s+from',  # namespace imports
-            r'import\s+{([^}]+)}\s+from',  # named imports
-            r'import\s+(\w+)\s*,\s*{([^}]+)}\s+from',  # mixed imports
+            r'import\s+(\w+)\s+from',
+            r'import\s+\*\s+as\s+(\w+)\s+from',
+            r'import\s+{([^}]+)}\s+from',
+            r'import\s+(\w+)\s*,\s*{([^}]+)}\s+from',
         ]
         
         for pattern in import_patterns:
@@ -176,7 +148,6 @@ def extract_valid_identifiers_from_reference(reference_code):
                 else:
                     valid_ids.add(match.strip())
         
-        # Extract type imports (TypeScript)
         type_imports = re.findall(r'import\s+type\s+{([^}]+)}\s+from', reference_code)
         for imports_str in type_imports:
             for name in imports_str.split(','):
@@ -186,11 +157,9 @@ def extract_valid_identifiers_from_reference(reference_code):
                 if clean_name:
                     valid_ids.add(clean_name)
         
-        # Extract interface and type definitions
         interfaces = re.findall(r'(?:interface|type)\s+(\w+)', reference_code)
         valid_ids.update(interfaces)
         
-        # Extract const/let/var declarations that might be used as constants
         const_declarations = re.findall(r'(?:const|let|var)\s+(\w+)', reference_code)
         valid_ids.update(const_declarations)
         
@@ -200,39 +169,26 @@ def extract_valid_identifiers_from_reference(reference_code):
     return valid_ids
 
 def check_code_validity(code, reference_code=None):
-    """
-    Check for common code errors and return a validity score.
-    Returns a score between -1.0 (very invalid) and 0.0 (valid).
-    Checks for:
-    1. Basic syntax errors (unmatched braces, brackets, parentheses)
-    2. Undefined variables (common React/TS patterns)
-    3. Missing imports for React
-    4. Function/component structure issues
-    5. Truncated/incomplete code
-    """
     validity_score = 0.0
     penalties = []
     
-    # Check for truncated/incomplete code (CRITICAL for quality)
     is_truncated = False
     truncation_indicators = [
-        code.count('{') > code.count('}'),  # More opening than closing braces
-        code.count('[') > code.count(']'),  # Unbalanced brackets
-        code.rstrip().endswith((',', '(', '[', '{', '<')),  # Ends with opening token
-        not code.rstrip().endswith(('}', ';', '>', ')', '`', '"', "'")),  # Doesn't end properly
+        code.count('{') > code.count('}'),
+        code.count('[') > code.count(']'),
+        code.rstrip().endswith((',', '(', '[', '{', '<')),
+        not code.rstrip().endswith(('}', ';', '>', ')', '`', '"', "'")),
     ]
     
-    if sum(truncation_indicators) >= 2:  # Multiple indicators suggest truncation
+    if sum(truncation_indicators) >= 2:
         is_truncated = True
-        validity_score -= 1.5  # HEAVY penalty for truncation
+        validity_score -= 1.5
         penalties.append("Code is truncated/incomplete - CRITICAL ERROR")
     
-    # Extract valid identifiers from reference code if provided
     reference_identifiers = set()
     if reference_code:
         reference_identifiers = extract_valid_identifiers_from_reference(reference_code)
     
-    # Check 1: Balanced braces, brackets, and parentheses
     try:
         brace_count = code.count('{') - code.count('}')
         bracket_count = code.count('[') - code.count(']')
@@ -250,40 +206,27 @@ def check_code_validity(code, reference_code=None):
     except:
         validity_score -= 0.1
     
-    # Check 2: Common undefined variable patterns
-    # Look for variables used but not defined (basic heuristic)
     try:
-        # Extract variable assignments (const, let, var, function parameters)
         defined_vars = set()
-        
-        # Find variable declarations
         const_vars = re.findall(r'(?:const|let|var)\s+(\w+)', code)
         defined_vars.update(const_vars)
         
-        # Find function declarations
         func_vars = re.findall(r'function\s+(\w+)', code)
         defined_vars.update(func_vars)
         
-        # Find arrow function assignments
         arrow_vars = re.findall(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:\(|async)', code)
         defined_vars.update(arrow_vars)
         
-        # Find function parameters (simplified)
         params = re.findall(r'(?:function\s+\w+|=>)\s*\(([^)]*)\)', code)
         for param_list in params:
             param_names = re.findall(r'(\w+)(?:\s*:|,|$)', param_list)
             defined_vars.update(param_names)
         
-        # Check for common React hooks and variables that should exist
         common_react = {'useState', 'useEffect', 'useCallback', 'useMemo', 'useRef', 'useContext', 
                         'React', 'props', 'children', 'className', 'style', 'key', 'ref'}
         defined_vars.update(common_react)
-        
-        # Add identifiers from reference code (imports, constants, etc.)
         defined_vars.update(reference_identifiers)
         
-        # Find variable usages (simplified - look for standalone words that are likely variables)
-        # This is a heuristic and won't catch everything
         used_vars = re.findall(r'\b([a-z][a-zA-Z0-9]*)\b', code)
         used_vars = set([v for v in used_vars if not v in ['const', 'let', 'var', 'function', 'return', 
                                                              'if', 'else', 'for', 'while', 'switch', 
@@ -293,18 +236,15 @@ def check_code_validity(code, reference_code=None):
                                                              'try', 'catch', 'finally', 'throw', 'new',
                                                              'typeof', 'instanceof', 'in', 'of', 'delete']])
         
-        # Check for potentially undefined variables
         potentially_undefined = used_vars - defined_vars
         
-        # Filter out common valid identifiers
         valid_identifiers = {'console', 'window', 'document', 'Array', 'Object', 'String', 
                            'Number', 'Boolean', 'Math', 'Date', 'JSON', 'Promise',
                            'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-                           'px', 'em', 'rem', 'vh', 'vw', 'FC', 'ReactNode', 'ReactElement'}  # CSS units + React types
+                           'px', 'em', 'rem', 'vh', 'vw', 'FC', 'ReactNode', 'ReactElement'}
         
         potentially_undefined = potentially_undefined - valid_identifiers
         
-        # Penalize if there are many undefined variables (more than 5 could be a problem)
         if len(potentially_undefined) > 5:
             validity_score -= 0.3
             penalties.append(f"Potentially undefined variables: {len(potentially_undefined)}")
@@ -312,18 +252,14 @@ def check_code_validity(code, reference_code=None):
         validity_score -= 0.05
         penalties.append(f"Variable analysis error: {str(e)}")
     
-    # Check 3: Missing React import (for TSX/JSX code)
-    # Only penalize if reference doesn't have imports either (be lenient about imports)
-    if '<' in code and '>' in code:  # Likely JSX
+    if '<' in code and '>' in code:
         has_imports = 'import' in code.lower()
         reference_has_imports = reference_code and 'import' in reference_code.lower()
         
-        # Only penalize if generated has no imports but reference does
         if not has_imports and reference_has_imports:
-            validity_score -= 0.05  # Reduced penalty
+            validity_score -= 0.05
             penalties.append("Missing imports (present in reference)")
     
-    # Check 4: Component structure (should have at least a return or export)
     has_return = 'return' in code.lower()
     has_export = 'export' in code.lower()
     
@@ -331,9 +267,7 @@ def check_code_validity(code, reference_code=None):
         validity_score -= 0.2
         penalties.append("Missing return or export statement")
     
-    # Check 5: Syntax error indicators (unclosed strings, common mistakes)
     try:
-        # Count quotes (should be even)
         single_quotes = code.count("'") - code.count("\\'")
         double_quotes = code.count('"') - code.count('\\"')
         backticks = code.count('`')
@@ -350,30 +284,72 @@ def check_code_validity(code, reference_code=None):
     except:
         validity_score -= 0.05
     
-    # Check 6: Common React/TypeScript errors
-    # Using useState without destructuring
     if 'useState(' in code and 'const [' not in code and 'const {' not in code:
-        # This might indicate incorrect useState usage
         validity_score -= 0.1
         penalties.append("Possible incorrect useState usage")
     
-    # Clamp score to -1.0 minimum
     validity_score = max(validity_score, -1.0)
     
     return validity_score, penalties
 
+def compute_dynamic_react_reward(code):
+    """Reward dynamic/interactive React features."""
+    dynamic_score = 0.0
+    features_found = []
+    
+    if 'useState' in code:
+        dynamic_score += 0.25
+        features_found.append("useState")
+    if 'useReducer' in code:
+        dynamic_score += 0.15
+        features_found.append("useReducer")
+    if 'useContext' in code:
+        dynamic_score += 0.10
+        features_found.append("useContext")
+    
+    if 'useEffect' in code:
+        dynamic_score += 0.15
+        features_found.append("useEffect")
+    if 'useLayoutEffect' in code:
+        dynamic_score += 0.10
+        features_found.append("useLayoutEffect")
+    
+    event_handlers = ['onClick', 'onChange', 'onSubmit', 'onFocus', 'onBlur',
+                      'onMouseEnter', 'onMouseLeave', 'onKeyDown', 'onKeyUp',
+                      'onInput', 'onSelect', 'onScroll']
+    found_handlers = [handler for handler in event_handlers if handler in code]
+    if found_handlers:
+        handler_score = min(len(found_handlers) * 0.05, 0.15)
+        dynamic_score += handler_score
+        features_found.append(f"event_handlers({len(found_handlers)})")
+    
+    has_conditional = ('?' in code and ':' in code) or '&&' in code
+    if has_conditional:
+        dynamic_score += 0.10
+        features_found.append("conditional_rendering")
+    
+    if re.search(r'\.map\s*\(', code):
+        dynamic_score += 0.10
+        features_found.append("map")
+    if re.search(r'\.filter\s*\(', code):
+        dynamic_score += 0.05
+        features_found.append("filter")
+    
+    if 'useRef' in code or 'createRef' in code:
+        dynamic_score += 0.05
+        features_found.append("refs")
+    
+    if 'useMemo' in code or 'useCallback' in code or 'React.memo' in code or 'memo(' in code:
+        dynamic_score += 0.05
+        features_found.append("memoization")
+    
+    dynamic_score = min(dynamic_score, 1.0)
+    return dynamic_score, features_found
+
 def compute_code_reward(generated_code, reference_code):
-    """
-    SIMPLIFIED REWARD FUNCTION - Focus on Core Quality:
-    1. Code completeness (not truncated) - CRITICAL
-    2. Basic validity (balanced braces, brackets, parens) - IMPORTANT  
-    3. Quote balancing (NEW) - IMPORTANT (30% of errors)
-    4. Reasonable length - MINOR
-    """
     gen_len = len(generated_code)
     ref_len = len(reference_code)
     
-    # CRITICAL: Check if code is complete (not truncated)
     completeness_reward = 0.0
     truncation_indicators = [
         generated_code.count('{') != generated_code.count('}'),
@@ -383,74 +359,58 @@ def compute_code_reward(generated_code, reference_code):
     ]
     
     if sum(truncation_indicators) >= 2:
-        # Code is truncated - HEAVY penalty
         completeness_reward = -1.0 * REWARD_COMPLETENESS_WEIGHT
     else:
-        # Code is complete - REWARD this!
         completeness_reward = 0.5 * REWARD_COMPLETENESS_WEIGHT
     
-    # IMPORTANT: Basic validity checks (braces, brackets, parentheses)
     validity_reward = 0.0
-    
-    # Check balanced braces
     if generated_code.count('{') == generated_code.count('}'):
         validity_reward += 0.3 * REWARD_VALIDITY_WEIGHT
     else:
         validity_reward -= 0.5 * REWARD_VALIDITY_WEIGHT
     
-    # Check balanced brackets
     if generated_code.count('[') == generated_code.count(']'):
         validity_reward += 0.15 * REWARD_VALIDITY_WEIGHT
     else:
         validity_reward -= 0.25 * REWARD_VALIDITY_WEIGHT
     
-    # Check balanced parentheses
     if generated_code.count('(') == generated_code.count(')'):
         validity_reward += 0.15 * REWARD_VALIDITY_WEIGHT
     else:
         validity_reward -= 0.25 * REWARD_VALIDITY_WEIGHT
     
-    # Check has return statement (basic React component requirement)
     if 'return' in generated_code.lower():
         validity_reward += 0.2 * REWARD_VALIDITY_WEIGHT
     
-    # NEW: Quote balancing reward (30% of eval errors were quote issues)
     quote_reward = 0.0
-    
-    # Check balanced single quotes (excluding escaped ones)
     single_quotes = generated_code.count("'") - generated_code.count("\\'")
     if single_quotes % 2 == 0:
         quote_reward += 0.4 * REWARD_QUOTE_WEIGHT
     else:
         quote_reward -= 0.6 * REWARD_QUOTE_WEIGHT
     
-    # Check balanced double quotes (excluding escaped ones)
     double_quotes = generated_code.count('"') - generated_code.count('\\"')
     if double_quotes % 2 == 0:
         quote_reward += 0.3 * REWARD_QUOTE_WEIGHT
     else:
         quote_reward -= 0.5 * REWARD_QUOTE_WEIGHT
     
-    # Check balanced backticks (template literals)
     backticks = generated_code.count('`')
     if backticks % 2 == 0:
         quote_reward += 0.3 * REWARD_QUOTE_WEIGHT
     else:
         quote_reward -= 0.5 * REWARD_QUOTE_WEIGHT
     
-    # MINOR: Length penalty (don't deviate too much from reference)
+    dynamic_score, dynamic_features = compute_dynamic_react_reward(generated_code)
+    dynamic_reward = dynamic_score * REWARD_DYNAMIC_REACT_WEIGHT
+    
     length_penalty = -abs(gen_len - ref_len) / max(ref_len, 1) * REWARD_LENGTH_PENALTY_WEIGHT
     
-    # Combine all rewards
-    total_reward = REWARD_BASE + completeness_reward + validity_reward + quote_reward + length_penalty
+    total_reward = REWARD_BASE + completeness_reward + validity_reward + quote_reward + dynamic_reward + length_penalty
     
     return total_reward
 
 async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
-    """
-    Asynchronous sampling that processes trajectories as they complete.
-    Returns processed data ready for PPO update.
-    """
     params = types.SamplingParams(
         max_tokens=MAX_GENERATION_TOKENS, 
         temperature=0.7, 
@@ -458,7 +418,6 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         stop=GENERATION_STOP_SEQUENCES
     )
     
-    # Prepare all sampling requests with context
     contexts = []
     coroutines = []
     prompt_lengths = []
@@ -468,21 +427,18 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         prompt_len = len(prompt_tokens)
         prompt_lengths.append(prompt_len)
         
-        # Safety check: Ensure prompt + max_tokens doesn't exceed context window
         if prompt_len + MAX_GENERATION_TOKENS > 32768:
             print(f"WARNING: Skipping prompt with {prompt_len} tokens (would exceed context window)")
             continue
         
         prompt_input = types.ModelInput.from_ints(prompt_tokens)
         
-        # Find reference response for reward computation
         ref_response = ""
         for ex in data:
             if ex["full_prompt"] == prompt_text:
                 ref_response = ex["reference_response"]
                 break
         
-        # sample_async returns a coroutine that needs to be awaited
         coro = sampling_client.sample_async(
             prompt=prompt_input, 
             sampling_params=params, 
@@ -496,23 +452,19 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             "ref_response": ref_response
         })
     
-    # Log prompt length statistics
     if prompt_lengths:
         print(f"      Prompt lengths - Min: {min(prompt_lengths)}, Max: {max(prompt_lengths)}, Avg: {sum(prompt_lengths)/len(prompt_lengths):.0f}")
     
-    # Launch ALL sampling requests concurrently using asyncio.gather
     print(f"      🚀 Launching {len(coroutines)} concurrent sampling requests...")
     sample_start = time.time()
     results = await asyncio.gather(*coroutines)
     sample_time = time.time() - sample_start
     print(f"      ✅ All samples completed in {sample_time:.1f}s ({sample_time/len(coroutines):.2f}s per prompt)")
     
-    # Process all results
     processed_data = []
     reward_stats = {"total": [], "count": 0}
     
     for idx, (result, ctx) in enumerate(zip(results, contexts)):
-        # Process each sample in the batch
         for seq in result.sequences:
             generated_tokens = seq.tokens
             if seq.logprobs is None:
@@ -521,14 +473,12 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             else:
                 logprobs = seq.logprobs
             
-            # Decode and compute reward immediately
             generated_text = tokenizer.decode(generated_tokens)
             reward = compute_code_reward(generated_text, ctx["ref_response"])
             
             reward_stats["total"].append(reward)
             reward_stats["count"] += 1
             
-            # Create PPO datum
             all_tokens = ctx["prompt_tokens"] + generated_tokens
             target_tokens = all_tokens[1:]
             input_tokens = all_tokens[:-1]
@@ -536,7 +486,6 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             old_logprobs = [0.0] * len(ctx["prompt_tokens"]) + logprobs
             old_logprobs = old_logprobs[1:]
             
-            # Apply full reward to each generated token, zero to prompt tokens
             prompt_length = len(ctx["prompt_tokens"]) - 1
             advantages = [0.0] * prompt_length + [reward] * len(generated_tokens)
             
@@ -550,7 +499,6 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             )
             processed_data.append(datum)
     
-    # Log reward statistics
     if reward_stats["total"]:
         avg_reward = np.mean(reward_stats["total"])
         min_reward = np.min(reward_stats["total"])
@@ -585,33 +533,27 @@ async def train_ppo():
         print(f"EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
         print(f"{'='*70}")
         
-        # Stage 1: Save weights and create sampling client
         t1 = time.time()
         print(f"[1/4] Saving weights...")
         sampling_client = training_client.save_weights_and_get_sampling_client(name=f"temp_epoch_{epoch}")
         print(f"      ⏱️  {time.time() - t1:.1f}s")
         
-        # Stage 2: Async sampling
         t2 = time.time()
         prompts = [ex["full_prompt"] for ex in data]
         print(f"[2/4] Sampling {len(prompts)} prompts × {NUM_SAMPLES_PER_PROMPT} samples = {len(prompts) * NUM_SAMPLES_PER_PROMPT} total...")
         processed_examples = await sample_trajectories_async(sampling_client, tokenizer, prompts, data)
         print(f"      ⏱️  {time.time() - t2:.1f}s")
         
-        # Stage 3: Training step
         t3 = time.time()
         print(f"[3/4] Running forward/backward and optimizer step...")
-        # Submit both requests (first await)
         fwdbwd_future = await training_client.forward_backward_async(processed_examples, "ppo")
         optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=LEARNING_RATE))
-        # Wait for results to complete (second await)
         fwdbwd_result, optim_result = await asyncio.gather(
             fwdbwd_future.result_async(),
             optim_future.result_async()
         )
         print(f"      ⏱️  {time.time() - t3:.1f}s")
         
-        # Stage 4: Log metrics
         logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
         avg_logprob = np.mean(logprobs)
         epoch_time = time.time() - epoch_start
@@ -624,7 +566,6 @@ async def train_ppo():
     return sampling_client, tokenizer, data
 
 async def evaluate(sampling_client, tokenizer, data):
-    # Limit evaluation to NUM_EVAL_EXAMPLES for faster feedback
     eval_data = data[:NUM_EVAL_EXAMPLES]
     
     print(f"\n{'='*70}")
@@ -638,7 +579,6 @@ async def evaluate(sampling_client, tokenizer, data):
         stop=GENERATION_STOP_SEQUENCES
     )
     
-    # Prepare all evaluation samples
     coroutines = []
     contexts = []
     
@@ -653,10 +593,8 @@ async def evaluate(sampling_client, tokenizer, data):
             "example": example
         })
     
-    # Launch ALL evaluation samples concurrently
     eval_results = await asyncio.gather(*coroutines)
     
-    # Process all results
     for eval_result, ctx in zip(eval_results, contexts):
         idx = ctx["idx"]
         example = ctx["example"]
@@ -687,7 +625,6 @@ async def evaluate(sampling_client, tokenizer, data):
     return results
 
 async def main():
-    """Main async entry point for training and evaluation."""
     sampling_client, tokenizer, data = await train_ppo()
     await evaluate(sampling_client, tokenizer, data)
 
