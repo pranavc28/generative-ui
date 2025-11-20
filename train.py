@@ -4,7 +4,7 @@ GRPO (Group Relative Policy Optimization) Training with Async Sampling (Tinker A
 GRPO samples multiple responses per prompt and uses group-relative advantages:
 1. Sample N responses for each prompt (NUM_SAMPLES_PER_PROMPT)
 2. Compute rewards for all responses
-3. Normalize advantages within each group (mean=0, std=1)
+3. Compute advantages as: reward - group_mean (mean-centered within each group)
 4. This provides a self-baseline: good responses get positive advantages,
    bad responses get negative advantages, all relative to their group
 
@@ -492,28 +492,27 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         groups.append({"ctx": ctx, "samples": group_samples})
     
     # GRPO Step 2: Compute group-relative advantages
-    # For each prompt group, normalize advantages: (reward - group_mean) / (group_std + eps)
+    # For each prompt group, compute advantages as: reward - group_mean
     processed_data = []
-    advantage_stats = {"normalized": [], "raw_rewards": []}
+    advantage_stats = {"advantages": [], "raw_rewards": []}
     
     for group in groups:
         ctx = group["ctx"]
         samples = group["samples"]
         
-        # Compute group statistics
+        # Compute group baseline (mean of group rewards)
         group_rewards = [s["reward"] for s in samples]
-        group_mean = np.mean(group_rewards)
-        group_std = np.std(group_rewards)
+        baseline = sum(group_rewards) / len(group_rewards)  # Group mean as baseline
         
-        # Normalize advantages within the group
+        # Compute advantages: reward - baseline
         for sample in samples:
             raw_reward = sample["reward"]
-            normalized_advantage = (raw_reward - group_mean) / (group_std + 1e-8)
+            advantage = raw_reward - baseline
             
-            advantage_stats["normalized"].append(normalized_advantage)
+            advantage_stats["advantages"].append(advantage)
             advantage_stats["raw_rewards"].append(raw_reward)
             
-            # Create Datum with normalized advantages
+            # Create Datum with group-relative advantages
             all_tokens = ctx["prompt_tokens"] + sample["generated_tokens"]
             target_tokens = all_tokens[1:]
             input_tokens = all_tokens[:-1]
@@ -521,9 +520,10 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             old_logprobs = [0.0] * len(ctx["prompt_tokens"]) + sample["logprobs"]
             old_logprobs = old_logprobs[1:]
             
-            prompt_length = len(ctx["prompt_tokens"]) - 1
-            # Use normalized advantage for generated tokens, 0 for prompt tokens
-            advantages = [0.0] * prompt_length + [normalized_advantage] * len(sample["generated_tokens"])
+            prompt_length = len(ctx["prompt_tokens"])
+            gen_length = len(sample["generated_tokens"])
+            # Create per-token advantage array: 0 for prompt, advantage for generation
+            advantages = [0.0] * (prompt_length - 1) + [advantage] * gen_length
             
             datum = types.Datum(
                 model_input=types.ModelInput.from_ints(tokens=input_tokens),
@@ -543,12 +543,12 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
         std_reward = np.std(reward_stats["total"])
         print(f"      Rewards (raw) - Avg: {avg_reward:.3f} ± {std_reward:.3f}, Range: [{min_reward:.3f}, {max_reward:.3f}]")
     
-    if advantage_stats["normalized"]:
-        avg_adv = np.mean(advantage_stats["normalized"])
-        std_adv = np.std(advantage_stats["normalized"])
-        min_adv = np.min(advantage_stats["normalized"])
-        max_adv = np.max(advantage_stats["normalized"])
-        print(f"      Advantages (normalized) - Avg: {avg_adv:.3f} ± {std_adv:.3f}, Range: [{min_adv:.3f}, {max_adv:.3f}]")
+    if advantage_stats["advantages"]:
+        avg_adv = np.mean(advantage_stats["advantages"])
+        std_adv = np.std(advantage_stats["advantages"])
+        min_adv = np.min(advantage_stats["advantages"])
+        max_adv = np.max(advantage_stats["advantages"])
+        print(f"      Advantages (group-relative) - Avg: {avg_adv:.3f} ± {std_adv:.3f}, Range: [{min_adv:.3f}, {max_adv:.3f}]")
     
     return processed_data
 
