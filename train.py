@@ -1,16 +1,19 @@
 """
-PPO Training with Asynchronous Grouped Policy Training (Tinker API)
+GRPO (Group Relative Policy Optimization) Training with Async Sampling (Tinker API)
 
-This implementation uses async sampling and processing for improved efficiency:
-1. sample_async() launches all sampling requests asynchronously
-2. Trajectories are processed and rewards computed as samples complete
-3. forward_backward_async() and optim_step_async() overlap computation
-4. Evaluation also uses async sampling for faster inference
+GRPO samples multiple responses per prompt and uses group-relative advantages:
+1. Sample N responses for each prompt (NUM_SAMPLES_PER_PROMPT)
+2. Compute rewards for all responses
+3. Normalize advantages within each group (mean=0, std=1)
+4. This provides a self-baseline: good responses get positive advantages,
+   bad responses get negative advantages, all relative to their group
 
-This approach provides:
-- Immediate feedback as samples complete
-- Better GPU utilization through overlapping compute
-- Faster training iterations compared to synchronous batching
+Async implementation:
+- sample_async() launches all sampling requests asynchronously
+- forward_backward_async() and optim_step_async() overlap computation
+- Evaluation also uses async sampling for faster inference
+
+This provides better GPU utilization and faster training iterations.
 """
 import os
 import json
@@ -30,16 +33,14 @@ NUM_EVAL_EXAMPLES = 10  # Evaluate on subset for faster feedback (600 would take
 MAX_PROMPT_TOKENS = 16000  # Filter: Keep prompts under 16k tokens (leave 16k for generation)
 BASE_MODEL = "Qwen/Qwen3-30B-A3B"
 LEARNING_RATE = 1e-5
-NUM_PPO_EPOCHS = 5  # INCREASED: More epochs for better convergence
-NUM_SAMPLES_PER_PROMPT = 4  # INCREASED: More samples for better exploration and policy gradients
+NUM_GRPO_EPOCHS = 5  # INCREASED: More epochs for better convergence
+NUM_SAMPLES_PER_PROMPT = 4  # GRPO: Multiple samples per prompt for group-relative advantages
 MAX_GENERATION_TOKENS = 16000  # Reduced from 20k: Model has 32k context, need room for long prompts
 GENERATION_STOP_SEQUENCES = ["</code>", "```\n\n", "\n\n\n\n"]  # Stop sequences to detect completion
-PPO_CLIP_EPSILON = 0.2
-VALUE_CLIP_EPSILON = 0.2
-GAE_LAMBDA = 0.95
+GRPO_CLIP_EPSILON = 0.2  # Clip ratio for policy gradient
 ENTROPY_COEFF = 0.01
 OUTPUT_DIR = "outputs"
-CHECKPOINT_NAME = "react-code-ppo-qwen3-30b-a3b-v6"
+CHECKPOINT_NAME = "react-code-grpo-qwen3-30b-a3b-v1"
 
 REWARD_BASE = 1.0
 REWARD_COMPLETENESS_WEIGHT = 15.0
@@ -461,10 +462,12 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
     sample_time = time.time() - sample_start
     print(f"      ✅ All samples completed in {sample_time:.1f}s ({sample_time/len(coroutines):.2f}s per prompt)")
     
-    processed_data = []
+    # GRPO Step 1: Collect all samples and rewards, grouped by prompt
+    groups = []  # Each element: {"ctx": ctx, "samples": [{"tokens": ..., "logprobs": ..., "reward": ...}]}
     reward_stats = {"total": [], "count": 0}
     
     for idx, (result, ctx) in enumerate(zip(results, contexts)):
+        group_samples = []
         for seq in result.sequences:
             generated_tokens = seq.tokens
             if seq.logprobs is None:
@@ -479,15 +482,48 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             reward_stats["total"].append(reward)
             reward_stats["count"] += 1
             
-            all_tokens = ctx["prompt_tokens"] + generated_tokens
+            group_samples.append({
+                "generated_tokens": generated_tokens,
+                "logprobs": logprobs,
+                "reward": reward,
+                "generated_text": generated_text
+            })
+        
+        groups.append({"ctx": ctx, "samples": group_samples})
+    
+    # GRPO Step 2: Compute group-relative advantages
+    # For each prompt group, normalize advantages: (reward - group_mean) / (group_std + eps)
+    processed_data = []
+    advantage_stats = {"normalized": [], "raw_rewards": []}
+    
+    for group in groups:
+        ctx = group["ctx"]
+        samples = group["samples"]
+        
+        # Compute group statistics
+        group_rewards = [s["reward"] for s in samples]
+        group_mean = np.mean(group_rewards)
+        group_std = np.std(group_rewards)
+        
+        # Normalize advantages within the group
+        for sample in samples:
+            raw_reward = sample["reward"]
+            normalized_advantage = (raw_reward - group_mean) / (group_std + 1e-8)
+            
+            advantage_stats["normalized"].append(normalized_advantage)
+            advantage_stats["raw_rewards"].append(raw_reward)
+            
+            # Create Datum with normalized advantages
+            all_tokens = ctx["prompt_tokens"] + sample["generated_tokens"]
             target_tokens = all_tokens[1:]
             input_tokens = all_tokens[:-1]
             
-            old_logprobs = [0.0] * len(ctx["prompt_tokens"]) + logprobs
+            old_logprobs = [0.0] * len(ctx["prompt_tokens"]) + sample["logprobs"]
             old_logprobs = old_logprobs[1:]
             
             prompt_length = len(ctx["prompt_tokens"]) - 1
-            advantages = [0.0] * prompt_length + [reward] * len(generated_tokens)
+            # Use normalized advantage for generated tokens, 0 for prompt tokens
+            advantages = [0.0] * prompt_length + [normalized_advantage] * len(sample["generated_tokens"])
             
             datum = types.Datum(
                 model_input=types.ModelInput.from_ints(tokens=input_tokens),
@@ -499,17 +535,25 @@ async def sample_trajectories_async(sampling_client, tokenizer, prompts, data):
             )
             processed_data.append(datum)
     
+    # Print statistics
     if reward_stats["total"]:
         avg_reward = np.mean(reward_stats["total"])
         min_reward = np.min(reward_stats["total"])
         max_reward = np.max(reward_stats["total"])
         std_reward = np.std(reward_stats["total"])
-        print(f"      Rewards - Avg: {avg_reward:.3f} ± {std_reward:.3f}, Range: [{min_reward:.3f}, {max_reward:.3f}]")
+        print(f"      Rewards (raw) - Avg: {avg_reward:.3f} ± {std_reward:.3f}, Range: [{min_reward:.3f}, {max_reward:.3f}]")
+    
+    if advantage_stats["normalized"]:
+        avg_adv = np.mean(advantage_stats["normalized"])
+        std_adv = np.std(advantage_stats["normalized"])
+        min_adv = np.min(advantage_stats["normalized"])
+        max_adv = np.max(advantage_stats["normalized"])
+        print(f"      Advantages (normalized) - Avg: {avg_adv:.3f} ± {std_adv:.3f}, Range: [{min_adv:.3f}, {max_adv:.3f}]")
     
     return processed_data
 
 
-async def train_ppo():
+async def train_grpo():
     service_client = tinker.ServiceClient()
     training_client = await service_client.create_lora_training_client_async(base_model=BASE_MODEL)
     
@@ -520,17 +564,17 @@ async def train_ppo():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     print(f"\n{'='*70}")
-    print(f"PPO TRAINING: {BASE_MODEL}")
+    print(f"GRPO TRAINING: {BASE_MODEL}")
     print(f"Training Examples: {len(data)} | Eval Examples: {NUM_EVAL_EXAMPLES}")
-    print(f"Epochs: {NUM_PPO_EPOCHS} | LR: {LEARNING_RATE}")
+    print(f"Epochs: {NUM_GRPO_EPOCHS} | LR: {LEARNING_RATE}")
     print(f"Samples/Prompt: {NUM_SAMPLES_PER_PROMPT} | Max Tokens: {MAX_GENERATION_TOKENS}")
     print(f"Total samples per epoch: {len(data) * NUM_SAMPLES_PER_PROMPT}")
     print(f"{'='*70}\n")
     
-    for epoch in range(NUM_PPO_EPOCHS):
+    for epoch in range(NUM_GRPO_EPOCHS):
         epoch_start = time.time()
         print(f"\n{'='*70}")
-        print(f"EPOCH {epoch + 1}/{NUM_PPO_EPOCHS}")
+        print(f"EPOCH {epoch + 1}/{NUM_GRPO_EPOCHS}")
         print(f"{'='*70}")
         
         t1 = time.time()
@@ -546,7 +590,7 @@ async def train_ppo():
         
         t3 = time.time()
         print(f"[3/4] Running forward/backward and optimizer step...")
-        fwdbwd_future = await training_client.forward_backward_async(processed_examples, "ppo")
+        fwdbwd_future = await training_client.forward_backward_async(processed_examples, "grpo")
         optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=LEARNING_RATE))
         fwdbwd_result, optim_result = await asyncio.gather(
             fwdbwd_future.result_async(),
@@ -625,7 +669,7 @@ async def evaluate(sampling_client, tokenizer, data):
     return results
 
 async def main():
-    sampling_client, tokenizer, data = await train_ppo()
+    sampling_client, tokenizer, data = await train_grpo()
     await evaluate(sampling_client, tokenizer, data)
 
 if __name__ == "__main__":
